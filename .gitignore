@@ -1,0 +1,11 @@
+venv/
+.env
+__pycache__/
+*.pyc
+output/
+*.csv
+*.xlsx
+.DS_Store
+logs/
+.reasonix/
+_test_*.py
