@@ -26,8 +26,7 @@ from amap_agent.config import (
     validate_config,
 )
 from amap_agent.fetcher import fetch_pois
-from amap_agent.groupbuy import parse_groupbuy_info
-from amap_agent.aggregator import aggregate_and_clean, apply_groupbuy_filter
+from amap_agent.aggregator import aggregate_and_clean
 from amap_agent.exporter import export_to_table, save_search_history
 
 logger = logging.getLogger(__name__)
@@ -192,11 +191,6 @@ def run(user_input: str) -> Dict[str, Any]:
             "ask_for_input": msg,
         }
 
-    # 判断场景
-    is_scene_b = (modifier == "groupbuy")
-    if is_scene_b:
-        print(f"[Agent] 检测到团购需求，将以「{keyword}」为关键词搜索，并过滤出支持团购的商家")
-
     # 第三步：执行主流程
     try:
         city = intent.get("city", "")
@@ -249,53 +243,13 @@ def run(user_input: str) -> Dict[str, Any]:
 
         # 3.2 数据清洗与聚合
         print(f"[Agent] 正在清洗和聚合数据（共 {len(raw_pois)} 条原始数据）...")
-        cleaned_data = aggregate_and_clean(raw_pois, filter_groupbuy=is_scene_b)
+        cleaned_data = aggregate_and_clean(raw_pois)
 
-        # 3.3 解析团购信息
-        groupbuy_success = 0
-        groupbuy_failed = 0
+        # 3.3 统计有评分的商家数
+        rating_count = sum(1 for item in cleaned_data if item.get("rating"))
+        print(f"[进度] 数据清洗完成: 共 {len(cleaned_data)} 家, 其中有评分 {rating_count} 家")
 
-        print(f"[Agent] 正在解析各商家的团购信息（共 {len(cleaned_data)} 家）...")
-        for idx, item in enumerate(cleaned_data):
-            poi_id = item.get("id", "")
-            detail_url = item.get("_detail_url", "")
-
-            gb_result = parse_groupbuy_info(
-                api_key=AMAP_API_KEY,
-                poi_id=poi_id,
-                detail_url=detail_url or None,
-            )
-
-            item["groupbuy"] = gb_result.get("groupbuy", "fetch_failed")
-            item["groupbuy_url"] = gb_result.get("url", "")
-
-            if gb_result.get("groupbuy") is True:
-                groupbuy_success += 1
-            elif gb_result.get("groupbuy") == "fetch_failed":
-                groupbuy_failed += 1
-
-            # 每10条打印一次进度
-            if (idx + 1) % 10 == 0:
-                print(f"[进度] 团购解析: {idx + 1}/{len(cleaned_data)}")
-
-        print(f"[进度] 团购解析完成: 成功 {groupbuy_success} 家, 降级 {groupbuy_failed} 家")
-
-        # 3.4 场景B：过滤无团购商家
-        if is_scene_b:
-            before_filter = len(cleaned_data)
-            cleaned_data = apply_groupbuy_filter(cleaned_data)
-            print(f"[Agent] 团购过滤完成: {before_filter} -> {len(cleaned_data)} 家")
-            if not cleaned_data:
-                msg = f"在「{region}」的「{keyword}」中未找到支持团购的商家"
-                logger.info(msg)
-                return {
-                    "success": True,
-                    "statistics": {"total": 0},
-                    "result": msg,
-                    "intent": {"region": region, "keyword": keyword, "modifier": modifier},
-                }
-
-        # 3.5 导出表格文件
+        # 3.4 导出表格文件
         print("[Agent] 正在生成表格文件...")
         file_path = export_to_table(
             data=cleaned_data,
@@ -307,13 +261,11 @@ def run(user_input: str) -> Dict[str, Any]:
         # 第四步：统计汇报
         statistics = {
             "total": len(cleaned_data),
-            "groupbuy_yes": groupbuy_success,
-            "groupbuy_failed": groupbuy_failed,
-            "filtered": is_scene_b,
+            "rating_count": rating_count,
         }
 
-        logger.info("执行完成: 共 %d 条, 团购 %d 家, 降级 %d 家",
-                     statistics["total"], statistics["groupbuy_yes"], statistics["groupbuy_failed"])
+        logger.info("执行完成: 共 %d 条, 有评分 %d 家",
+                     statistics["total"], statistics["rating_count"])
 
         result_msg = (
             f"\n{'='*50}\n"
@@ -321,8 +273,7 @@ def run(user_input: str) -> Dict[str, Any]:
             f"   - 目标区域: {region}\n"
             f"   - 搜索品类: {keyword}\n"
             f"   - 共获取: {statistics['total']} 家商家\n"
-            f"   - 支持团购: {statistics['groupbuy_yes']} 家\n"
-            f"   - 需人工核验: {statistics['groupbuy_failed']} 家\n"
+            f"   - 其中有评分: {statistics['rating_count']} 家\n"
             f"   - 文件保存至: {file_path}\n"
             f"{'='*50}"
         )
@@ -343,8 +294,7 @@ def run(user_input: str) -> Dict[str, Any]:
                 "keyword": keyword,
                 "modifier": modifier or "",
                 "total": statistics["total"],
-                "groupbuy_yes": statistics["groupbuy_yes"],
-                "groupbuy_failed": statistics["groupbuy_failed"],
+                "rating_count": statistics["rating_count"],
                 "file_path": file_path,
             })
         except Exception as e:

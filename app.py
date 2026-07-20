@@ -71,12 +71,8 @@ if search_clicked and user_input.strip():
             # 统计卡片
             c1, c2, c3 = st.columns(3)
             c1.metric(":bar_chart: 商家总数", total)
-            c2.metric(
-                ":white_check_mark: 支持团购", stats.get("groupbuy_yes", 0)
-            )
-            c3.metric(
-                ":warning: 需人工核验", stats.get("groupbuy_failed", 0)
-            )
+            c2.metric(":star: 有评分商家", stats.get("rating_count", 0))
+            c3.metric(":chart_with_downwards_trend: 无评分商家", total - stats.get("rating_count", 0))
 
             # 读取生成的 CSV 并展示
             file_path = result.get("file_path", "")
@@ -86,17 +82,14 @@ if search_clicked and user_input.strip():
                     # 列名中文化
                     col_rename = {
                         "name": "门店名称",
-                        "address": "地址",
-                        "location": "经纬度",
+                        "same_name_count": "同名门店数量",
                         "pname": "省份",
                         "cityname": "城市",
                         "adname": "区县",
+                        "address": "地址",
                         "tel": "电话",
+                        "rating": "评分",
                         "type": "POI类型",
-                        "same_name_count": "同名门店数量",
-                        "groupbuy": "是否支持团购",
-                        "groupbuy_url": "团购详情页",
-                        "collect_year": "高德收录年份",
                     }
                     df_display = df.rename(
                         columns={
@@ -128,7 +121,7 @@ if search_clicked and user_input.strip():
                         from io import BytesIO
                         output = BytesIO()
                         with pd.ExcelWriter(output, engine="openpyxl") as writer:
-                            df.to_excel(writer, index=False, sheet_name="商家数据")
+                            df_display.to_excel(writer, index=False, sheet_name="商家数据")
                         st.download_button(
                             label=":page_facing_up: 下载 Excel",
                             data=output.getvalue(),
@@ -179,8 +172,7 @@ with st.expander(":scroll: 搜索历史记录", expanded=False):
                     "keyword": "品类",
                     "modifier": "修饰词",
                     "total": "结果数",
-                    "groupbuy_yes": "团购成功",
-                    "groupbuy_failed": "降级数量",
+                    "rating_count": "有评分数",
                     "file_path": "生成文件",
                 }
                 df_h = df_history.rename(

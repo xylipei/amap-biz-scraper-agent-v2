@@ -8,4 +8,5 @@ output/
 .DS_Store
 logs/
 .reasonix/
+.workbuddy/
 _test_*.py

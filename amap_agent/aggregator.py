@@ -44,32 +44,46 @@ def _extract_base_name(name: str) -> str:
     return name.strip()
 
 
+def _extract_rating(poi: Dict[str, Any]) -> str:
+    """
+    从 POI 原始数据中提取评分。
+
+    高德搜索接口（extensions=all）返回的 biz_ext.rating 通常是字符串（如 "4.5"），
+    但部分 POI 可能无 biz_ext 或 rating 为空。统一返回字符串，无评分时返回空串。
+    """
+    biz_ext = poi.get("biz_ext")
+    if not isinstance(biz_ext, dict):
+        return ""
+    rating = biz_ext.get("rating")
+    if rating is None:
+        return ""
+    rating_str = str(rating).strip()
+    # 过滤掉 "[]" 等无效值
+    if rating_str in ("", "[]", "null", "None"):
+        return ""
+    return rating_str
+
+
 def aggregate_and_clean(
     raw_pois_list: List[Dict[str, Any]],
-    filter_groupbuy: bool = False,
 ) -> List[Dict[str, Any]]:
     """
     清洗原始POI数据，统计同名门店数量。
 
     参数：
         raw_pois_list: fetch_pois 返回的原始POI数据列表
-        filter_groupbuy: 是否过滤掉无团购的商家（场景B逻辑）
 
     返回：
         统一结构的字典列表，每个字典包含以下字段：
         - name: 门店名称
-        - address: 地址
-        - location: 经纬度
+        - same_name_count: 同名门店数量
         - pname: 省份
         - cityname: 城市
         - adname: 区县
+        - address: 地址
         - tel: 电话
-        - same_name_count: 同名门店数量
-        - adcode: 区域代码
+        - rating: 评分（来自高德 biz_ext.rating，可能为空）
         - type: POI类型
-        - groupbuy: 团购状态（由groupbuy模块填充）
-        - groupbuy_url: 团购详情页URL（由groupbuy模块填充）
-        - collect_year: 收录年份（始终填N/A）
     """
     if not raw_pois_list:
         logger.info("原始POI列表为空，返回空结果")
@@ -80,22 +94,17 @@ def aggregate_and_clean(
     for poi in raw_pois_list:
         cleaned_item = {
             "name": _extract_field(poi, "name"),
-            "address": _extract_field(poi, "address"),
-            "location": _extract_field(poi, "location"),
+            "same_name_count": 0,
             "pname": _extract_field(poi, "pname"),
             "cityname": _extract_field(poi, "cityname"),
             "adname": _extract_field(poi, "adname"),
+            "address": _extract_field(poi, "address"),
             "tel": _extract_field(poi, "tel"),
+            "rating": _extract_rating(poi),
             "type": _extract_field(poi, "type"),
+            # 内部字段（不导出，保留备查）
             "adcode": _extract_field(poi, "adcode"),
             "id": _extract_field(poi, "id"),
-            # 以下字段后续由 groupbuy 模块和本模块填充
-            "same_name_count": 0,
-            "groupbuy": "",
-            "groupbuy_url": "",
-            "collect_year": "N/A",  # 高德API不提供收录年份，固定填N/A
-            # 保留原始detail_url供groupbuy模块使用
-            "_detail_url": _extract_field(poi, "detail"),
         }
         cleaned_list.append(cleaned_item)
 
@@ -115,64 +124,9 @@ def aggregate_and_clean(
             item["same_name_count"] = name_counter[item["_base_name"]]
         item.pop("_base_name", None)
 
-    # 第三步：场景B - 团购过滤
-    if filter_groupbuy:
-        before_count = len(cleaned_list)
-        # 只保留 groupbuy 为 True 的商家
-        # （注意：此时 groupbuy 字段尚未填充，过滤逻辑由 agent 编排层在调用后处理）
-        # 此处标记后续需要执行过滤
-        logger.info(
-            "场景B逻辑已标记：filter_groupbuy=True，后续需移除无团购商家"
-        )
-
     logger.info(
         "数据清洗完成: 原始 %d 条 -> 清洗后 %d 条，同名统计已生成",
         len(raw_pois_list),
         len(cleaned_list),
     )
     return cleaned_list
-
-
-def apply_groupbuy_filter(
-    cleaned_data: List[Dict[str, Any]],
-) -> List[Dict[str, Any]]:
-    """
-    场景B：根据团购字段过滤，仅保留明确有团购的商家。
-
-    过滤规则：
-    - groupbuy=True -> 保留
-    - groupbuy="fetch_failed" -> 保留（标注"需人工核验"）
-    - groupbuy=False / "" -> 剔除
-
-    参数：
-        cleaned_data: 已经过团购解析的数据列表
-
-    返回：
-        过滤后的数据列表
-    """
-    total_before = len(cleaned_data)
-    has_groupbuy = 0
-    fetch_failed = 0
-
-    filtered = []
-    for item in cleaned_data:
-        gb = item.get("groupbuy")
-        if gb is True:
-            filtered.append(item)
-            has_groupbuy += 1
-        elif gb == "fetch_failed":
-            # 降级处理：保留但标记需人工核验
-            item["groupbuy"] = "需人工核验"
-            filtered.append(item)
-            fetch_failed += 1
-        # groupbuy=False 或 "" -> 剔除
-
-    total_after = len(filtered)
-    logger.info(
-        "团购过滤完成: 过滤前 %d 条 -> 过滤后 %d 条 (有团购 %d, 降级 %d)",
-        total_before,
-        total_after,
-        has_groupbuy,
-        fetch_failed,
-    )
-    return filtered

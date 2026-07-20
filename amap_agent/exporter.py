@@ -54,18 +54,34 @@ def _get_export_fields() -> List[str]:
     """获取导出字段列表（统一顺序）"""
     return [
         "name",
-        "address",
-        "location",
+        "same_name_count",
         "pname",
         "cityname",
         "adname",
+        "address",
         "tel",
+        "rating",
         "type",
-        "same_name_count",
-        "groupbuy",
-        "groupbuy_url",
-        "collect_year",
     ]
+
+
+# 字段英文 key -> 中文表头映射（CSV 和 Excel 导出共用，保持一致）
+_FIELD_DISPLAY = {
+    "name": "门店名称",
+    "same_name_count": "同名门店数量",
+    "pname": "省份",
+    "cityname": "城市",
+    "adname": "区县",
+    "address": "地址",
+    "tel": "电话",
+    "rating": "评分",
+    "type": "POI类型",
+}
+
+
+def _display_header(fields: List[str]) -> List[str]:
+    """把英文字段名映射为中文表头，未命中的字段原样保留。"""
+    return [_FIELD_DISPLAY.get(f, f) for f in fields]
 
 
 def _sanitize_csv_cell(value: str) -> str:
@@ -168,8 +184,11 @@ def _export_csv(
         filepath += ".csv"
 
     with open(filepath, "w", newline="", encoding="utf-8-sig") as f:
+        # 写中文表头（与 Excel 导出保持一致）
+        header = _display_header(fields)
+        csv.writer(f).writerow(header)
+        # 写数据行：DictWriter 按 fields 顺序取值，表头已单独写过，不再调 writeheader
         writer = csv.DictWriter(f, fieldnames=fields)
-        writer.writeheader()
         for item in data:
             writer.writerow(_prepare_row(item, fields))
 
@@ -202,24 +221,8 @@ def _export_excel(
     ws = wb.active
     ws.title = "商家数据"
 
-    # 写表头
-    header_row = []
-    field_display = {
-        "name": "门店名称",
-        "address": "地址",
-        "location": "经纬度",
-        "pname": "省份",
-        "cityname": "城市",
-        "adname": "区县",
-        "tel": "电话",
-        "type": "POI类型",
-        "same_name_count": "同名门店数量",
-        "groupbuy": "是否支持团购",
-        "groupbuy_url": "团购详情页",
-        "collect_year": "高德收录年份",
-    }
-    for field in fields:
-        header_row.append(field_display.get(field, field))
+    # 写表头（中文，与 CSV 导出共用 _FIELD_DISPLAY 映射）
+    header_row = _display_header(fields)
     ws.append(header_row)
 
     # 写数据行
@@ -256,8 +259,7 @@ HISTORY_FIELDS = [
     "keyword",
     "modifier",
     "total",
-    "groupbuy_yes",
-    "groupbuy_failed",
+    "rating_count",
     "file_path",
 ]
 
