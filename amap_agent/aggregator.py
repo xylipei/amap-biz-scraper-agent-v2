@@ -89,11 +89,17 @@ def aggregate_and_clean(
         logger.info("原始POI列表为空，返回空结果")
         return []
 
-    # 第一步：提取统一字段
+    # 第一步：提取统一字段（门店名称含"炒货"的直接过滤掉）
+    EXCLUDE_KEYWORDS = ("炒货",)
     cleaned_list: List[Dict[str, Any]] = []
+    excluded_count = 0
     for poi in raw_pois_list:
+        name = _extract_field(poi, "name")
+        if any(kw in name for kw in EXCLUDE_KEYWORDS):
+            excluded_count += 1
+            continue
         cleaned_item = {
-            "name": _extract_field(poi, "name"),
+            "name": name,
             "same_name_count": 0,
             "pname": _extract_field(poi, "pname"),
             "cityname": _extract_field(poi, "cityname"),
@@ -107,6 +113,9 @@ def aggregate_and_clean(
             "id": _extract_field(poi, "id"),
         }
         cleaned_list.append(cleaned_item)
+
+    if excluded_count:
+        logger.info("已过滤含 %s 的门店 %d 条", EXCLUDE_KEYWORDS, excluded_count)
 
     # 第二步：统计同名门店数量（按品牌基础名聚合）
     for item in cleaned_list:
