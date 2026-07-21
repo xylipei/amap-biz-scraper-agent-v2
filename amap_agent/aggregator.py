@@ -89,8 +89,8 @@ def aggregate_and_clean(
         logger.info("原始POI列表为空，返回空结果")
         return []
 
-    # 第一步：提取统一字段（门店名称含"炒货"的直接过滤掉）
-    EXCLUDE_KEYWORDS = ("炒货",)
+    # 第一步：提取统一字段（门店名称含"炒货"/"花生"的直接过滤掉）
+    EXCLUDE_KEYWORDS = ("炒货", "花生")
     cleaned_list: List[Dict[str, Any]] = []
     excluded_count = 0
     for poi in raw_pois_list:
