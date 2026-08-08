@@ -9,4 +9,5 @@ output/
 logs/
 .reasonix/
 .workbuddy/
+reasonix.toml
 _test_*.py

@@ -19,13 +19,24 @@ from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
 
+# 高德返回的无效占位值（统一清洗为空串）
+_INVALID_VALUES = ("", "[]", "null", "None", "none", "NaN")
+
+
+def _clean_str(value: str) -> str:
+    """清洗字段值：去掉首尾空白，无效占位值（[]/null/None 等）统一转为空串"""
+    v = value.strip()
+    if v in _INVALID_VALUES:
+        return ""
+    return v
+
 
 def _extract_field(poi: Dict[str, Any], field: str, default: str = "") -> str:
-    """安全提取POI字段，处理None值"""
+    """安全提取POI字段，处理None值，并清洗无效占位值"""
     value = poi.get(field)
     if value is None:
         return default
-    return str(value).strip()
+    return _clean_str(str(value))
 
 
 def _extract_base_name(name: str) -> str:
@@ -57,11 +68,8 @@ def _extract_rating(poi: Dict[str, Any]) -> str:
     rating = biz_ext.get("rating")
     if rating is None:
         return ""
-    rating_str = str(rating).strip()
-    # 过滤掉 "[]" 等无效值
-    if rating_str in ("", "[]", "null", "None"):
-        return ""
-    return rating_str
+    # 过滤掉 "[]" 等无效占位值
+    return _clean_str(str(rating))
 
 
 def aggregate_and_clean(
@@ -77,6 +85,7 @@ def aggregate_and_clean(
         统一结构的字典列表，每个字典包含以下字段：
         - name: 门店名称
         - same_name_count: 同名门店数量
+        - collect_year: 高德收录年份（PRD 2.2：高德不提供，固定返回 "N/A"，禁止伪造）
         - pname: 省份
         - cityname: 城市
         - adname: 区县
@@ -84,6 +93,9 @@ def aggregate_and_clean(
         - tel: 电话
         - rating: 评分（来自高德 biz_ext.rating，可能为空）
         - type: POI类型
+        - groupbuy: 团购状态（清洗阶段为空串，由团购检测步骤填充）
+        - groupbuy_url: 商户详情页链接（团购检测用）
+        - id / detail_url: 内部字段（不导出，团购检测用）
     """
     if not raw_pois_list:
         logger.info("原始POI列表为空，返回空结果")
@@ -101,6 +113,7 @@ def aggregate_and_clean(
         cleaned_item = {
             "name": name,
             "same_name_count": 0,
+            "collect_year": "N/A",  # PRD 2.2：高德不提供收录年份，禁止伪造
             "pname": _extract_field(poi, "pname"),
             "cityname": _extract_field(poi, "cityname"),
             "adname": _extract_field(poi, "adname"),
@@ -108,9 +121,14 @@ def aggregate_and_clean(
             "tel": _extract_field(poi, "tel"),
             "rating": _extract_rating(poi),
             "type": _extract_field(poi, "type"),
-            # 内部字段（不导出，保留备查）
+            # 团购字段：清洗阶段为空，由 agent 的团购检测步骤填充
+            "groupbuy": "",
+            "groupbuy_url": "",
+            # 内部字段（不导出，团购检测用）
             "adcode": _extract_field(poi, "adcode"),
             "id": _extract_field(poi, "id"),
+            # 高德接口字段名不统一（detail_url / detailUrl），兼容两者
+            "detail_url": _extract_field(poi, "detail_url") or _extract_field(poi, "detailUrl"),
         }
         cleaned_list.append(cleaned_item)
 
@@ -139,3 +157,27 @@ def aggregate_and_clean(
         len(cleaned_list),
     )
     return cleaned_list
+
+
+def apply_groupbuy_filter(cleaned_data: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """
+    场景B过滤（PRD 3.2）：仅保留有团购活动（groupbuy=True）或
+    因反爬需人工核验（groupbuy="fetch_failed"）的商家，剔除明确无团购的商家。
+
+    参数：
+        cleaned_data: 已完成团购检测的数据列表（item["groupbuy"] 已被填充）
+
+    返回：
+        过滤后的数据列表
+    """
+    kept: List[Dict[str, Any]] = []
+    removed = 0
+    for item in cleaned_data:
+        gb = item.get("groupbuy")
+        if gb is True or gb == "fetch_failed":
+            kept.append(item)
+        else:
+            removed += 1
+
+    logger.info("场景B过滤: 保留 %d 家, 剔除无团购 %d 家", len(kept), removed)
+    return kept

@@ -23,13 +23,31 @@ import requests
 
 from amap_agent.config import (
     PLACE_TEXT_URL,
+    PLACE_AROUND_URL,
+    GEOCODE_URL,
     REQUEST_INTERVAL,
     MAX_RETRIES,
     PAGE_SIZE,
+    AROUND_RADIUS,
+    AROUND_PAGE_SIZE,
     ERR_QUOTA_EXCEEDED,
 )
 
 logger = logging.getLogger(__name__)
+
+# 地理编码 level 优先级（数值越小越精确，用于多个候选结果时消解歧义）
+_GEOCODE_LEVEL_PRIORITY = {
+    "兴趣点": 1,
+    "门牌号": 2,
+    "道路": 3,
+    "乡镇": 4,
+    "街道": 5,
+    "区县": 6,
+    "市": 7,
+    "城市": 7,
+    "省": 8,
+    "省份": 8,
+}
 
 
 def _request_with_retry(url: str, params: Dict[str, Any], retries: int = MAX_RETRIES) -> Dict[str, Any]:
@@ -142,7 +160,9 @@ def fetch_pois(
         data = _request_with_retry(PLACE_TEXT_URL, params)
 
         pois = data.get("pois", [])
-        total_count = int(data.get("count", "0"))
+        # count 可能为 None/缺失（高德异常时），兜底为 0
+        raw_count = data.get("count") or "0"
+        total_count = int(raw_count) if str(raw_count).isdigit() else 0
 
         if not pois:
             logger.info("第%d页无数据，抓取结束", page)
@@ -173,4 +193,166 @@ def fetch_pois(
 
     print(f"[进度] 抓取完成，共获取 {len(all_pois)} 条商家信息")
     logger.info("抓取完成: 共计 %d 条POI数据", len(all_pois))
+    return all_pois
+
+
+def geocode_address(
+    api_key: str,
+    address: str,
+    city: str = "",
+) -> Optional[str]:
+    """
+    地理编码：将文本地址转换为经纬度字符串（"经度,纬度"）。
+
+    参数：
+        api_key: 高德地图API Key
+        address: 结构化地址描述（如"南京市鼓楼区政府大楼"）
+        city: 可选，指定城市以收窄歧义（如"南京"）
+
+    返回：
+        经纬度字符串（如 "118.777636,32.061586"）；解析失败返回 None
+
+    抛出：
+        RuntimeError: API配额超限或Key无效时
+    """
+    if not address:
+        logger.warning("geocode 收到空地址")
+        return None
+
+    params: Dict[str, Any] = {
+        "key": api_key,
+        "address": address,
+    }
+    if city:
+        params["city"] = city
+
+    logger.info("地理编码: address='%s', city='%s'", address, city or "未指定")
+    data = _request_with_retry(GEOCODE_URL, params)
+
+    geocodes = data.get("geocodes") or []
+    if not geocodes:
+        logger.warning("地理编码无结果: address='%s'", address)
+        return None
+
+    # 歧义消解：多个候选结果时优先精确级别（兴趣点/门牌号 > 道路 > 乡镇/街道 > 区县 > 城市）
+    best = geocodes[0]
+    best_prio = _GEOCODE_LEVEL_PRIORITY.get(best.get("level", ""), 99)
+    for g in geocodes[1:]:
+        prio = _GEOCODE_LEVEL_PRIORITY.get(g.get("level", ""), 99)
+        if prio < best_prio:
+            best, best_prio = g, prio
+
+    if best is not geocodes[0]:
+        logger.info("地理编码歧义消解: %d 个候选中优先 level='%s' 的 '%s'",
+                    len(geocodes), best.get("level", ""), best.get("formatted_address", ""))
+
+    location = best.get("location", "")
+    if not location:
+        logger.warning("地理编码结果缺少 location: address='%s'", address)
+        return None
+
+    logger.info("地理编码成功: '%s' -> %s (level=%s)",
+                address, location, best.get("level", ""))
+    return location
+
+
+def split_anchors(anchor_text: str) -> List[str]:
+    """
+    拆分多地点锚点文本（支持中文顿号、逗号、空格、"和/与"分隔）。
+
+    参数：
+        anchor_text: 用户输入的地点锚点原文（如"南京市鼓楼区政府大楼、南京站"）
+
+    返回：
+        去空后的地点列表
+    """
+    import re
+    parts = re.split(r"[、，,;；和与\s]+", anchor_text)
+    return [p.strip() for p in parts if p.strip()]
+
+
+def fetch_pois_around(
+    api_key: str,
+    location: str,
+    keyword: str,
+    radius: int = AROUND_RADIUS,
+    max_pages: Optional[int] = None,
+) -> List[Dict[str, Any]]:
+    """
+    周边搜索：以经纬度为中心抓取指定半径内的POI数据。
+
+    参数：
+        api_key: 高德地图API Key
+        location: 中心点经纬度字符串（"经度,纬度"）
+        keyword: 搜索关键词（如"水果商超"）
+        radius: 搜索半径（米），默认 AROUND_RADIUS(3000)，最大 50000
+        max_pages: 最大抓取页数，None表示抓取全部
+
+    返回：
+        POI原始数据字典列表
+
+    抛出：
+        RuntimeError: API配额超限时
+    """
+    if not location:
+        logger.warning("周边搜索收到空 location")
+        return []
+
+    all_pois: List[Dict[str, Any]] = []
+    page = 1
+
+    logger.info("开始周边搜索: keyword='%s', location='%s', radius=%d, max_pages=%s",
+                keyword, location, radius, max_pages or "全部")
+    print(f"[进度] 正在周边搜索「{keyword}」(半径{radius}米)...")
+
+    while True:
+        params = {
+            "key": api_key,
+            "location": location,
+            "keywords": keyword,
+            "radius": radius,
+            "page": page,
+            "offset": AROUND_PAGE_SIZE,
+            "sortrule": "distance",
+            "extensions": "all",
+        }
+
+        logger.debug("请求URL: %s, params: %s", PLACE_AROUND_URL,
+                     {k: v for k, v in params.items() if k != "key"})
+        data = _request_with_retry(PLACE_AROUND_URL, params)
+
+        pois = data.get("pois", [])
+        # count 可能为 None/缺失（高德异常时），兜底为 0
+        raw_count = data.get("count") or "0"
+        total_count = int(raw_count) if str(raw_count).isdigit() else 0
+
+        if not pois:
+            logger.info("第%d页无数据，周边搜索结束", page)
+            break
+
+        all_pois.extend(pois)
+        current_total = len(all_pois)
+
+        progress_msg = f"[进度] 周边搜索第 {page} 页 (已获取 {current_total} 条)..."
+        logger.info(progress_msg)
+        if page % 5 == 0:
+            print(progress_msg)
+
+        # 检查是否还有下一页
+        total_pages = (total_count + AROUND_PAGE_SIZE - 1) // AROUND_PAGE_SIZE if total_count > 0 else page
+        if page >= total_pages:
+            logger.info("已到达最后一页（第%d页），周边搜索结束", page)
+            break
+
+        # 达到最大页数限制
+        if max_pages is not None and page >= max_pages:
+            logger.info("已达到最大页数限制（%d页），周边搜索结束", max_pages)
+            break
+
+        # QPS控制：每次请求后休眠
+        page += 1
+        time.sleep(REQUEST_INTERVAL)
+
+    print(f"[进度] 周边搜索完成，共获取 {len(all_pois)} 条商家信息")
+    logger.info("周边搜索完成: 共计 %d 条POI数据", len(all_pois))
     return all_pois

@@ -13,6 +13,7 @@
 
 import logging
 import re
+import time
 from typing import Any, Dict, Optional
 
 import requests
@@ -31,6 +32,25 @@ GROUPBUY_PATTERNS = [
     re.compile(r"coupon", re.IGNORECASE),
 ]
 
+# detail API 频率限制：高德对 /place/detail 的 QPS 限制较严，
+# 连续调用易触发 CUQPS_HAS_EXCEEDED_THE_LIMIT，重试退避用
+_DETAIL_API_RETRY_SLEEP = 0.5
+
+
+def _build_detail_url(poi_id: str, detail_url: str = "") -> str:
+    """
+    构造商户详情页 URL。
+
+    高德 /place/around 接口返回的 POI 不包含 detail_url 字段，
+    但详情页 URL 有固定格式 https://ditu.amap.com/detail/{poi_id}，
+    可据此构造，保证团购检测降级时有链接可供人工核验。
+    """
+    if detail_url:
+        return detail_url
+    if poi_id:
+        return f"https://ditu.amap.com/detail/{poi_id}"
+    return ""
+
 
 def _check_groupbuy_via_detail_api(api_key: str, poi_id: str) -> Optional[bool]:
     """
@@ -43,51 +63,67 @@ def _check_groupbuy_via_detail_api(api_key: str, poi_id: str) -> Optional[bool]:
     返回：
         True/False 表示是否有团购，None 表示无法判断
     """
-    try:
-        params = {
-            "key": api_key,
-            "id": poi_id,
-        }
-        resp = requests.get(PLACE_DETAIL_URL, params=params, timeout=10)
-        resp.raise_for_status()
-        data = resp.json()
+    max_retries = 2  # 频率/QPS 超限时的额外重试次数
+    params = {
+        "key": api_key,
+        "id": poi_id,
+    }
 
-        if data.get("status") != "1":
-            logger.debug("detail API返回异常: %s", data.get("info", ""))
+    for attempt in range(max_retries + 1):
+        try:
+            resp = requests.get(PLACE_DETAIL_URL, params=params, timeout=10)
+            resp.raise_for_status()
+            data = resp.json()
+
+            if data.get("status") != "1":
+                info = data.get("info", "")
+                logger.debug("detail API返回异常: %s", info)
+                # 频率/QPS 超限：退避后重试
+                if ("CUQPS" in info or "FREQUENT" in info.upper()) and attempt < max_retries:
+                    time.sleep(_DETAIL_API_RETRY_SLEEP * (attempt + 1))
+                    continue
+                return None
+
+            pois = data.get("pois", [])
+            if not pois:
+                return None
+
+            poi = pois[0]
+
+            # 检查 biz_ext 中的团购信息
+            biz_ext = poi.get("biz_ext", {}) or {}
+            if biz_ext.get("groupbuy") or biz_ext.get("coupon"):
+                return True
+
+            # 检查 deep_info
+            deep_info = poi.get("deep_info", {}) or {}
+            if deep_info.get("groupbuy") or deep_info.get("is_group_buy") == "1":
+                return True
+
+            # 检查 photos 等字段中是否提及
+            photos = poi.get("photos", []) or []
+            for photo in photos:
+                title = photo.get("title", "") or ""
+                for pattern in GROUPBUY_PATTERNS:
+                    if pattern.search(title):
+                        return True
+
+            return False
+
+        except requests.exceptions.RequestException as e:
+            logger.warning("detail API请求失败 (poi_id=%s): %s", poi_id, e)
+            if attempt < max_retries:
+                time.sleep(_DETAIL_API_RETRY_SLEEP * (attempt + 1))
+                continue
+            return None
+        except (KeyError, ValueError, TypeError) as e:
+            logger.warning("detail API解析异常 (poi_id=%s): %s", poi_id, e)
+            if attempt < max_retries:
+                time.sleep(_DETAIL_API_RETRY_SLEEP * (attempt + 1))
+                continue
             return None
 
-        pois = data.get("pois", [])
-        if not pois:
-            return None
-
-        poi = pois[0]
-
-        # 检查 biz_ext 中的团购信息
-        biz_ext = poi.get("biz_ext", {}) or {}
-        if biz_ext.get("groupbuy") or biz_ext.get("coupon"):
-            return True
-
-        # 检查 deep_info
-        deep_info = poi.get("deep_info", {}) or {}
-        if deep_info.get("groupbuy") or deep_info.get("is_group_buy") == "1":
-            return True
-
-        # 检查 photos 等字段中是否提及
-        photos = poi.get("photos", []) or []
-        for photo in photos:
-            title = photo.get("title", "") or ""
-            for pattern in GROUPBUY_PATTERNS:
-                if pattern.search(title):
-                    return True
-
-        return False
-
-    except requests.exceptions.RequestException as e:
-        logger.warning("detail API请求失败 (poi_id=%s): %s", poi_id, e)
-        return None
-    except (KeyError, ValueError, TypeError) as e:
-        logger.warning("detail API解析异常 (poi_id=%s): %s", poi_id, e)
-        return None
+    return None
 
 
 def _check_groupbuy_via_h5(detail_url: str) -> Optional[bool]:
