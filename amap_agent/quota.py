@@ -105,11 +105,14 @@ def estimate_cost(n_requests: int) -> float:
 
 
 def format_quota_summary(estimate: int) -> str:
-    """生成配额预估摘要文案：预计 N 次请求 / 约 ¥M / 占本月 X% / 剩余 Y 次。"""
+    """生成配额预估摘要文案：预计 N 次请求 / 约 ¥M / 占本月 X% / 本机记账剩余 Y 次。
+
+    注：高德官方不提供配额查询接口，剩余为本地账本口径（仅统计本程序请求数）。
+    """
     limit = quota_limit()
     remaining = quota_remaining()
     pct = (estimate / limit * 100) if limit > 0 else 0.0
     return (
-        f"预计消耗约 {estimate} 次请求（约 ¥{estimate_cost(estimate)}，占本月配额 {pct:.0f}%），"
-        f"剩余 {remaining} 次"
+        f"预计消耗约 {estimate} 次请求（约 ¥{estimate_cost(estimate)}，占本机预警线 {pct:.0f}%），"
+        f"本机记账剩余 {remaining} 次"
     )

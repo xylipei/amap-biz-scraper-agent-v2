@@ -64,15 +64,21 @@ with st.container(border=True):
                 st.switch_page("workbench/pages/tasks.py")
 
 # ── 配额状态（本地账本，第一性：配额即预算） ──
+# 高德官方不提供配额查询接口，以下数字均为本机记账口径（仅统计本程序发出的请求数），
+# 并非高德真实已用量；权威数据请到高德控制台查看。
 from amap_agent.quota import quota_limit, quota_used, quota_remaining
 
 ql, qu, qr = quota_limit(), quota_used(), quota_remaining()
 if qr <= 0:
-    st.error(f"⚠️ 高德 API 配额已用尽（{ql:,} 次已全部用完），搜索将被熔断。请到「API 设置」调整上限或更换 Key。")
+    st.error(f"⚠️ 高德配额（本地记账）已用尽（{ql:,} 次预警线已用完），搜索将被熔断。请到「API 设置」调整上限或更换 Key。")
 elif ql > 0 and qr <= ql * 0.1:
-    st.warning(f"⚠️ 高德 API 配额剩余不足 10%（{qr:,}/{ql:,} 次），请注意控制搜索规模或调整上限。")
+    st.warning(f"⚠️ 高德配额（本地记账）剩余不足 10%（{qr:,}/{ql:,} 次），请注意控制搜索规模或调整上限。")
 else:
-    st.info(f"⚖️ 高德 API 配额：本月已用 {qu:,} / {ql:,} 次，剩余 {qr:,} 次。搜索前会预估消耗。")
+    st.info(
+        f"⚖️ 高德配额提示：高德官方**未提供配额查询接口**，此处为本机记账——"
+        f"本月本程序已发起 **{qu:,}** 次请求（上限 {ql:,} 次/月为手动配置的预警线，非官方数据）。"
+        f"真实已用量请到高德控制台查看；搜索前会预估本程序消耗。"
+    )
 
     if not (amap_ok and deepseek_ok and centers and tasks):
         st.caption("💡 新手建议：按步骤依次完成；或直接点「导入示例」快速体验。")

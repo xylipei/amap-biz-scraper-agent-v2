@@ -75,13 +75,14 @@ from amap_agent.quota import quota_limit, quota_used, quota_remaining, set_month
 with st.container(border=True):
     st.markdown("#### ⚖️ 配额预算")
     st.caption(
-        "高德 API 按调用次数计费（超量 30 元/万次）。本地账本自动记录每次请求，"
-        "配额用尽自动熔断；搜索前会预估消耗并展示。"
+        "高德 API 按调用次数计费（超量 30 元/万次），但官方**不提供配额查询接口**。"
+        "以下为本机记账（仅统计本程序发出的请求数，非官方已用量）：自动记录每次请求，"
+        "达到手动配置的预警线自动熔断；搜索前会预估本程序消耗。真实已用量请到高德控制台查看。"
     )
     c1, c2, c3 = st.columns(3)
-    c1.metric("本月配额上限", f"{quota_limit():,}")
-    c2.metric("已使用", f"{quota_used():,}")
-    c3.metric("剩余", f"{quota_remaining():,}")
+    c1.metric("预警线上限", f"{quota_limit():,}")
+    c2.metric("已使用(本机记账)", f"{quota_used():,}")
+    c3.metric("剩余(本机记账)", f"{quota_remaining():,}")
     with st.form("quota_form"):
         st.number_input(
             "月配额上限（次）",
