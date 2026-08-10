@@ -68,6 +68,41 @@ if st.session_state.pop("api_saved", False):
     st.success("✅ API Key 已保存并立即生效，上方状态已更新。")
 
 st.divider()
+
+# ── 配额预算（本地账本） ──
+from amap_agent.quota import quota_limit, quota_used, quota_remaining, set_monthly_limit
+
+with st.container(border=True):
+    st.markdown("#### ⚖️ 配额预算")
+    st.caption(
+        "高德 API 按调用次数计费（超量 30 元/万次）。本地账本自动记录每次请求，"
+        "配额用尽自动熔断；搜索前会预估消耗并展示。"
+    )
+    c1, c2, c3 = st.columns(3)
+    c1.metric("本月配额上限", f"{quota_limit():,}")
+    c2.metric("已使用", f"{quota_used():,}")
+    c3.metric("剩余", f"{quota_remaining():,}")
+    with st.form("quota_form"):
+        st.number_input(
+            "月配额上限（次）",
+            min_value=100,
+            max_value=100_000_000,
+            value=quota_limit(),
+            step=1000,
+            key="quota_limit_input",
+            help="个人认证默认 5000/月；企业认证 50000/月；商业授权 500000/月。按您的 Key 档位填写。",
+        )
+        q_submit = st.form_submit_button("保存配额上限")
+
+if q_submit:
+    new_limit = int(st.session_state.get("quota_limit_input", quota_limit()))
+    set_monthly_limit(new_limit)
+    st.session_state["quota_saved"] = True
+    st.rerun()
+if st.session_state.pop("quota_saved", False):
+    st.success(f"✅ 配额上限已更新为 {quota_limit():,} 次/月。")
+
+st.divider()
 st.info(
     "**说明**：\n"
     "- 密钥仅保存在本机 `.env` 文件中（已加入 .gitignore，不会提交到仓库）\n"

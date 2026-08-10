@@ -9,8 +9,8 @@
 - API 设置（客户填写高德/DeepSeek Key）
 - 中心点管理（批量配置搜索中心点）
 - 批量任务（多中心点一键抓取，实时进度）
-- 结果库（历史任务结果查看与下载）
-- 合并分析（合并去重 + 品牌聚合导出 Excel）
+- 交付中心（结果库查看/下载 + 合并去重/品牌聚合导出 Excel）
+- 使用帮助
 """
 
 import streamlit as st
@@ -32,8 +32,7 @@ pages = [
     st.Page("workbench/pages/settings.py", title="API 设置", icon=":material/key:"),
     st.Page("workbench/pages/centers.py", title="中心点管理", icon=":material/location_on:"),
     st.Page("workbench/pages/tasks.py", title="批量任务", icon=":material/rocket_launch:"),
-    st.Page("workbench/pages/results.py", title="结果库", icon=":material/folder_open:"),
-    st.Page("workbench/pages/merge.py", title="合并分析", icon=":material/table_chart:"),
+    st.Page("workbench/pages/delivery.py", title="交付中心", icon=":material/package_2:"),
     st.Page("workbench/pages/help.py", title="使用帮助", icon=":material/help:"),
 ]
 

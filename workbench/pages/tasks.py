@@ -106,7 +106,7 @@ with st.container(border=True):
             st.session_state.pop("running_task_id", None)
             ok = sum(1 for r in final.get("results", []) if r.get("status") == "done")
             fail = len(final.get("results", [])) - ok
-            st.success(f"任务完成！成功 {ok} 个中心点，失败 {fail} 个。可在「结果库」查看明细。")
+            st.success(f"任务完成！成功 {ok} 个中心点，失败 {fail} 个。可在「交付中心」查看明细。")
             task = final
         elif task.get("status") == "running" and (thread is None or not thread.is_alive()):
             # 中断遗留：页面重启后无活动线程但任务停在 running
