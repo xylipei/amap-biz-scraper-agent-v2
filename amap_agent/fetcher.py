@@ -30,6 +30,8 @@ from amap_agent.config import (
     PAGE_SIZE,
     AROUND_RADIUS,
     AROUND_PAGE_SIZE,
+    GRID_RADIUS,
+    GRID_N,
     ERR_QUOTA_EXCEEDED,
 )
 
@@ -65,11 +67,22 @@ def _request_with_retry(url: str, params: Dict[str, Any], retries: int = MAX_RET
     抛出：
         RuntimeError: 配额超限或所有重试耗尽
     """
+    from amap_agent.quota import quota_remaining, record_request
+
+    # 配额预算：请求前检查剩余，超限熔断（每次分页请求前都会检查）
+    if quota_remaining() <= 0:
+        raise RuntimeError(
+            "高德API配额已用尽（本月剩余 0 次）。"
+            "请提高配额上限（企业认证 50000/月）或更换 Key。"
+        )
+
     last_error = None
 
     for attempt in range(1, retries + 1):
         try:
             resp = requests.get(url, params=params, timeout=15)
+            # 配额记账：成功收到响应即计 1 次（网络层失败重试不消耗配额）
+            record_request()
             data = resp.json()
 
             # 检查API状态
@@ -356,3 +369,45 @@ def fetch_pois_around(
     print(f"[进度] 周边搜索完成，共获取 {len(all_pois)} 条商家信息")
     logger.info("周边搜索完成: 共计 %d 条POI数据", len(all_pois))
     return all_pois
+
+
+def generate_grid_anchors(
+    center_location: str,
+    radius: int = GRID_RADIUS,
+    grid_n: int = GRID_N,
+) -> List[str]:
+    """
+    生成 (2N+1)x(2N+1) 周边网格中心点（经纬度），用于突破单请求 200 条限制。
+
+    高德 POI 搜索「同请求参数翻页最多 200 条」，绕开方式之一是把区域拆成多个
+    网格圆心分别做 /place/around 搜索，各圆心独立拿到 200 条再合并去重。
+    相邻圆心间距=radius（默认小于 AROUND_RADIUS，保证搜索圆相互覆盖不留空洞）。
+
+    参数：
+        center_location: 中心点经纬度字符串（"经度,纬度"）
+        radius: 相邻圆心间距（米），默认 GRID_RADIUS
+        grid_n: 网格半边长，0=仅中心点(1x1)，1=3x3(9点)，2=5x5(25点)
+
+    返回：
+        网格点经纬度字符串列表（行优先，从西到东、从北到南）
+
+    示例：
+        generate_grid_anchors("118.78,32.06", radius=2500, grid_n=1)
+        -> ["118.7556,32.0825", "118.7781,32.0825", ..., "118.8006,32.0375"]
+    """
+    import math
+
+    if not center_location:
+        return []
+    lon_s, lat_s = center_location.split(",")
+    lon, lat = float(lon_s), float(lat_s)
+
+    # 1 度纬度 ≈ 111km；经度 1 度随纬度余弦收缩（高纬度处更窄）
+    dlat = radius / 111000.0
+    dlon = radius / (111000.0 * max(math.cos(math.radians(lat)), 1e-6))
+
+    points: List[str] = []
+    for i in range(-grid_n, grid_n + 1):
+        for j in range(-grid_n, grid_n + 1):
+            points.append(f"{lon + j * dlon:.6f},{lat + i * dlat:.6f}")
+    return points

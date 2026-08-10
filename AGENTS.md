@@ -24,12 +24,12 @@ amap_agent/
   agent.py                 Agent 编排 + DeepSeek 意图解析(run() 主流程:解析→校验→抓取→清洗→团购→导出→汇报)
   fetcher.py               高德抓取:fetch_pois(/place/text)、fetch_pois_around(/place/around)、geocode_address(geocode/geo);分页+3次重试+200ms QPS+配额错误码(10003/10044)终止
   aggregator.py            清洗统一字段、按品牌基础名统计同名门店(括号前)、apply_groupbuy_filter 场景B团购过滤
-  groupbuy.py              团购检测:detail API → H5 页面降级 → 全部失败返回 fetch_failed(永不崩溃)
+  groupbuy.py              团购标注(已停用网络检测):避免 /place/detail ID 查询烧配额,统一返回 fetch_failed+详情链接
   exporter.py              CSV(utf-8-sig)/Excel 导出 + 搜索历史 search_history.csv;公式注入防护
   config.py                环境变量读 Key + URL/常量 + 强制关闭 IPv6(本机 DNS 的 IPv6 不可达)
 ```
 
-执行流水线:`fetch_pois → aggregate_and_clean → _detect_groupbuy → (场景B过滤) → export_to_table`。
+执行流水线:`fetch_pois → aggregate_and_clean → _detect_groupbuy(仅标注,无网络请求) → (场景B过滤) → export_to_table`。
 
 ## Conventions
 

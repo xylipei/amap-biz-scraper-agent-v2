@@ -4,28 +4,35 @@
 职责：
 - 调用DeepSeek API解析用户自然语言输入，提取区域、品类、修饰词
 - 处理复合输入场景（场景A/B）
-- 编排任务流程：fetch_pois -> aggregate_and_clean -> parse_groupbuy_info -> export_to_table
+- 编排任务流程：fetch_pois -> aggregate_and_clean -> 团购标注(已停用网络检测) -> export_to_table
 - 统计结果汇报
 
 防跑偏要求（PRD 3.2）：
-- 场景B：自动将"水果团购"修正为"水果店"/"水果超市"，强制过滤无团购商家
+- 场景B：自动将"水果团购"修正为"水果店"/"水果超市";团购检测已停用（避免
+  /place/detail ID 查询烧配额），场景B 结果统一标注"需人工核验(附链接)"
 - 缺失核心参数时追问用户
 """
 
 import json
 import logging
 import re
-import time
+from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
 
 from openai import OpenAI, APIError
 
 from amap_agent import config
-from amap_agent.fetcher import fetch_pois, fetch_pois_around, geocode_address, split_anchors
+from amap_agent.fetcher import (
+    fetch_pois,
+    fetch_pois_around,
+    geocode_address,
+    split_anchors,
+    generate_grid_anchors,
+)
 from amap_agent.aggregator import aggregate_and_clean, apply_groupbuy_filter
-from amap_agent.groupbuy import parse_groupbuy_info
 from amap_agent.exporter import export_to_table, save_search_history
+from amap_agent.districts import CITY_DISTRICTS
 
 logger = logging.getLogger(__name__)
 
@@ -141,8 +148,8 @@ def _check_missing_params(intent: Dict[str, Any]) -> List[str]:
     """检查缺失的核心参数，返回缺失参数名的列表"""
     missing = []
     if intent.get("around"):
-        # 周边搜索模式：需要地点锚点 + 品类
-        if not intent.get("anchor"):
+        # 周边搜索模式：需要地点锚点 + 品类；锚点缺失但给出城市时自动网格铺点（D 方案）
+        if not intent.get("anchor") and not intent.get("city"):
             missing.append("地点锚点")
         if not intent.get("keyword"):
             missing.append("目标品类")
@@ -230,60 +237,243 @@ def _fetch_around_pois(
     return deduped, anchors[0]
 
 
+@dataclass
+class FetchTask:
+    """
+    一个抓取单元（分片计划的组成部分，统一三种覆盖策略）。
+
+    mode：
+        "text"   - /place/text 搜索：region 为区县/行政区名（可为空=全国）
+        "around" - /place/around 搜索：location 为文本锚点（执行时 geocode）
+        "grid"   - 自动网格：以 city 为中心铺 (2N+1)x(2N+1) 圆心逐点 around
+    """
+
+    mode: str
+    keyword: str = ""
+    region: str = ""        # text 模式
+    location: str = ""      # around 模式（文本锚点）
+    city: str = ""          # grid 模式 / 展示用
+    radius: int = 0          # around 模式半径
+    label: str = ""         # 展示/导出文件名用
+
+
+def build_fetch_plan(intent: Dict[str, Any]) -> List[FetchTask]:
+    """
+    意图 → 分片计划（统一区县拆分 B / 自动网格 D / 多锚点三种覆盖策略）。
+
+    计划按执行顺序排列：基础通道（text）在前，周边通道（around/grid）在后；
+    估算器（estimate_plan_requests）与执行器（execute_plan）共用同一份计划，
+    保证“预估多少就执行多少”。
+
+    参数：
+        intent: 意图字典（region/city/keyword/around/anchor）
+
+    返回：
+        抓取单元列表（FetchTask）
+    """
+    keyword = intent.get("keyword", "")
+    region = intent.get("region", "") or ""
+    city = intent.get("city", "") or ""
+    around = bool(intent.get("around"))
+    anchor = intent.get("anchor", "") or ""
+    districts = CITY_DISTRICTS.get(city) or []
+    plan: List[FetchTask] = []
+
+    if around:
+        # 通道一：基础搜索（text）
+        base_region = region or city
+        if base_region:
+            if not region and districts:
+                # B 方案：城市级输入拆分逐区县（各区县独立 200 条）
+                plan += [FetchTask("text", keyword=keyword, region=d, label=d) for d in districts]
+            else:
+                plan.append(FetchTask("text", keyword=keyword, region=base_region, label=base_region))
+        # 通道二：周边搜索
+        if anchor:
+            # 多锚点：每个锚点一个 around 单元
+            plan += [
+                FetchTask("around", keyword=keyword, location=a,
+                          radius=config.AROUND_RADIUS, label=a)
+                for a in split_anchors(anchor)
+            ]
+        elif city:
+            # D 方案：自动网格
+            plan.append(FetchTask("grid", keyword=keyword, city=city, label=city))
+    else:
+        if region:
+            plan.append(FetchTask("text", keyword=keyword, region=region, label=region))
+        elif city and districts:
+            # B 方案：城市级输入拆分逐区县
+            plan += [FetchTask("text", keyword=keyword, region=d, label=d) for d in districts]
+        else:
+            plan.append(FetchTask("text", keyword=keyword, region="", label=""))
+    return plan
+
+
+def estimate_plan_requests(plan: List[FetchTask]) -> int:
+    """
+    分片计划 → 预估请求数（保守上限口径，与 execute_plan 一一对应）。
+
+    - text：每单元 ≤10 页（200 条 / offset=20）
+    - around：每单元 8 页 + 1 次 geocode（文本锚点需解析）
+    - grid：每单元 (2N+1)² 圆心 × 8 页 + 1 次城市 geocode
+    """
+    grid_n = config.GRID_N
+    total = 0
+    for t in plan:
+        if t.mode == "text":
+            total += 10
+        elif t.mode == "around":
+            total += 8 + 1
+        elif t.mode == "grid":
+            total += (2 * grid_n + 1) ** 2 * 8 + 1
+    return total
+
+
+def format_plan_summary(plan: List[FetchTask]) -> str:
+    """分片计划 → 人类可读摘要（覆盖策略预览，搜索前展示）。"""
+    n_text = sum(1 for t in plan if t.mode == "text")
+    n_around = sum(1 for t in plan if t.mode == "around")
+    n_grid = sum(1 for t in plan if t.mode == "grid")
+    parts = []
+    if n_text:
+        parts.append(f"{n_text} 个行政区/区县")
+    if n_around:
+        parts.append(f"{n_around} 个锚点")
+    if n_grid:
+        parts.append(f"{n_grid} 组网格（{(2 * config.GRID_N + 1) ** 2} 圆心/组）")
+    return " + ".join(parts) if parts else "单次搜索"
+
+
+def execute_plan(keyword: str, plan: List[FetchTask], city: str = "") -> Tuple[List[Dict[str, Any]], str]:
+    """
+    按分片计划执行抓取（保持顺序），合并去重。
+
+    参数：
+        keyword: 搜索品类关键词
+        plan: build_fetch_plan 生成的分片计划
+        city: 城市名（区县拆分时用作导出/展示标签，与旧行为一致）
+
+    返回：
+        (去重后的 POI 原始数据列表, 展示/导出用标签)
+    """
+    text_pois: List[Dict[str, Any]] = []
+    around_pois: List[Dict[str, Any]] = []
+    label = ""
+
+    for t in plan:
+        if t.mode == "text":
+            if t.region:
+                print(f"[Agent] 正在搜索区域「{t.region}」的「{t.keyword}」...")
+            pois = fetch_pois(api_key=config.AMAP_API_KEY, keyword=t.keyword, region=t.region)
+            if pois:
+                print(f"[进度] 「{t.region or '全国'}」获取 {len(pois)} 条")
+            else:
+                print(f"[进度] 「{t.region or '全国'}」无结果")
+            text_pois.extend(pois)
+            if not label:
+                label = t.label  # text 单元只记录首个标签(区县拆分时末尾统一为 city)
+        elif t.mode == "around":
+            pois, lab = _fetch_around_pois(t.keyword, t.location, t.city)
+            around_pois.extend(pois)
+            if lab:
+                label = lab  # 周边锚点标签优先
+        elif t.mode == "grid":
+            pois, lab = _fetch_grid_around_pois(t.keyword, t.city)
+            around_pois.extend(pois)
+            if lab:
+                label = lab  # 网格标签(城市名)优先
+
+    # 去重（text 与 around 分别收集后统一合并）
+    raw_pois = _merge_pois(text_pois, around_pois)
+    if text_pois and around_pois and len(raw_pois) < len(text_pois) + len(around_pois):
+        print(f"[进度] 双通道合并: 基础 {len(text_pois)} + 周边 {len(around_pois)} -> 去重 {len(raw_pois)} 条")
+    elif text_pois and len(raw_pois) < len(text_pois):
+        print(f"[进度] 跨区县去重: {len(text_pois)} -> {len(raw_pois)} 条")
+    elif around_pois and len(raw_pois) < len(around_pois):
+        print(f"[进度] 周边去重: {len(around_pois)} -> {len(raw_pois)} 条")
+
+    # 展示/导出标签：优先周边标签；区县拆分(多 text 单元)且给 city 时统一用城市名
+    text_tasks = [t for t in plan if t.mode == "text"]
+    if len(text_tasks) > 1 and city:
+        label = city
+    elif not label and text_tasks:
+        label = text_tasks[0].region or ""
+    return raw_pois, label
+
+
+def _fetch_grid_around_pois(
+    keyword: str,
+    city: str,
+) -> Tuple[List[Dict[str, Any]], str]:
+    """
+    自动网格周边搜索（D 方案）：以城市中心铺 (2N+1)x(2N+1) 网格圆心逐点搜索。
+
+    高德对同一请求参数（同一圆心+半径）翻页最多 200 条；铺多个网格圆心
+    逐点 /place/around 搜索，各圆心独立 200 条再合并去重。
+
+    参数：
+        keyword: 搜索品类关键词
+        city: 城市名（用于地理编码取中心坐标）
+
+    返回：
+        (去重后的 POI 列表, 展示用标签)
+    """
+    center = geocode_address(config.AMAP_API_KEY, city)
+    if not center:
+        print(f"[警告] 城市「{city}」无法解析为坐标，自动网格跳过")
+        return [], ""
+    grid_anchors = generate_grid_anchors(center, config.GRID_RADIUS, config.GRID_N)
+    print(f"[Agent] 自动网格：以「{city}」为中心生成 {len(grid_anchors)} 个网格圆心"
+          f"（半径{config.AROUND_RADIUS}米，突破单请求 200 条上限）...")
+    all_pois: List[Dict[str, Any]] = []
+    for loc in grid_anchors:
+        pois = fetch_pois_around(
+            api_key=config.AMAP_API_KEY,
+            location=loc,
+            keyword=keyword,
+            radius=config.AROUND_RADIUS,
+        )
+        if pois:
+            print(f"[进度] 网格点 {loc} 获取 {len(pois)} 条")
+        all_pois.extend(pois)
+    if not all_pois:
+        return [], city
+    deduped = _merge_pois(all_pois)
+    if len(deduped) != len(all_pois):
+        print(f"[进度] 网格去重: {len(all_pois)} -> {len(deduped)} 条")
+    return deduped, city
+
+
 def _detect_groupbuy(cleaned_data: List[Dict[str, Any]]) -> Tuple[int, int]:
     """
-    对每条商家数据检测团购状态（PRD 2.2：填充"是否团购"字段）。
+    团购状态标注（已停用网络检测）。
 
-    优先调用高德 /place/detail API，失败时降级 H5 详情页，
-    单条失败不影响整体流程（parse_groupbuy_info 内部已全捕获）。
+    原实现逐店调用高德 /place/detail（ID 查询），单次搜索数千条 POI 即消耗
+    数千次配额（实测一次搜索 4860 次直接打满日额度）。团购字段对业务非关键，
+    已停用网络检测：统一标注 "fetch_failed"，表格显示"需人工核验(附链接)"。
 
     参数：
         cleaned_data: aggregate_and_clean 的输出列表（含 id / detail_url 内部字段）
 
     返回：
-        (有团购商家数, 降级/需人工核验商家数)
+        (有团购商家数, 需人工核验商家数) —— 恒为 (0, len(cleaned_data))
     """
     total = len(cleaned_data)
-    if not total:
-        return 0, 0
-
-    print(f"[Agent] 正在检测 {total} 家商家的团购状态...")
-    groupbuy_count = 0
-    fetch_failed_count = 0
-
-    for idx, item in enumerate(cleaned_data, 1):
+    for item in cleaned_data:
         poi_id = item.get("id", "")
         detail_url = item.get("detail_url", "")
-        # around 接口不返回 detail_url，按固定格式构造详情页 URL 供核验/H5 降级
+        # around 接口不返回 detail_url，按固定格式构造详情页 URL 供人工核验
         if not detail_url and poi_id:
             detail_url = f"https://ditu.amap.com/detail/{poi_id}"
             item["detail_url"] = detail_url
-        try:
-            result = parse_groupbuy_info(config.AMAP_API_KEY, poi_id, detail_url)
-        except Exception as e:
-            # 单条兜底：检测异常不中断整体流程
-            logger.warning("团购检测异常 (id=%s): %s", poi_id, e)
-            result = {"groupbuy": "fetch_failed", "url": detail_url}
-        item["groupbuy"] = result.get("groupbuy", "fetch_failed")
-        item["groupbuy_url"] = result.get("url", detail_url)
+        item["groupbuy"] = "fetch_failed"
+        item["groupbuy_url"] = detail_url
 
-        if item["groupbuy"] is True:
-            groupbuy_count += 1
-        elif item["groupbuy"] == "fetch_failed":
-            fetch_failed_count += 1
-
-        if idx % 10 == 0 or idx == total:
-            print(f"[进度] 团购检测 {idx}/{total} (有团购 {groupbuy_count}, 需核验 {fetch_failed_count})")
-
-        # 节流：detail API QPS 限制严格（实测 >2 QPS 触发 CUQPS），
-        # 调用间至少间隔 0.5s（H5 路径本身较慢，额外 sleep 影响可忽略）
-        if idx != total:
-            time.sleep(0.5)
-
-    no_groupbuy = total - groupbuy_count - fetch_failed_count
-    logger.info("团购检测完成: 有团购 %d 家, 无团购 %d 家, 需人工核验 %d 家",
-                groupbuy_count, no_groupbuy, fetch_failed_count)
-    return groupbuy_count, fetch_failed_count
+    if total:
+        print(f"[Agent] 团购检测已停用：{total} 家商家统一标注「需人工核验(附链接)」")
+    logger.info("团购检测（已停用）: %d 家商家统一标注 fetch_failed", total)
+    return 0, total
 
 
 
@@ -326,64 +516,46 @@ def run_with_intent(intent: Dict[str, Any], user_input: str = "") -> Dict[str, A
         around = bool(intent.get("around"))
         anchor_label = ""
 
-        if around and anchor_text:
-            # 3.0 双通道搜索（先基础后周边，合并去重，缓解单通道 200 条上限）
-            # 通道一：基础搜索（行政区/城市 /place/text，先执行）
-            base_region = region or city
-            base_pois: List[Dict[str, Any]] = []
-            if base_region:
-                print(f"[Agent] 通道一（基础搜索）：正在搜索区域「{base_region}」的「{keyword}」...")
-                base_pois = fetch_pois(
-                    api_key=config.AMAP_API_KEY,
-                    keyword=keyword,
-                    region=base_region,
-                )
-                if base_pois:
-                    print(f"[Agent] 基础搜索完成: 共 {len(base_pois)} 条")
+        # 3.0b 校验 region 格式，不符合时降级到 city
+        if not around and region and not _validate_region(region):
+            logger.warning("region 格式异常，降级到 city: region=%s -> city=%s", region, city)
+            region = ""
+            intent["region"] = ""
 
-            # 通道二：周边搜索（多锚点地理编码 + 周边搜索 + 去重）
-            around_pois, anchor_label = _fetch_around_pois(keyword, anchor_text, city)
+        # 分片计划：统一区县拆分(B)/自动网格(D)/多锚点覆盖策略，
+        # 估算器与执行器共用同一份计划（预估多少就执行多少）
+        plan = build_fetch_plan(intent)
 
-            # 合并去重（先基础后周边）
-            raw_pois = _merge_pois(base_pois, around_pois)
-            if base_pois and around_pois and len(raw_pois) < len(base_pois) + len(around_pois):
-                print(f"[进度] 双通道合并: 基础 {len(base_pois)} + 周边 {len(around_pois)} -> 去重 {len(raw_pois)} 条")
-        else:
-            # 3.0b 校验 region 格式，不符合时降级到 city
-            if region and not _validate_region(region):
-                logger.warning("region 格式异常，降级到 city: region=%s -> city=%s", region, city)
-                region = ""
+        # 配额预算：搜索前估算并展示（第一性：配额即预算；剩余为 0 直接中止）
+        try:
+            from amap_agent.quota import quota_remaining, format_quota_summary
 
-            # 3.1 抓取POI数据
-            search_region = region or city  # 有区县用区县，没有用城市
+            estimate = estimate_plan_requests(plan)
+            remaining = quota_remaining()
+            if estimate:
+                print(f"[Agent] ⚖️ 配额预估: {format_quota_summary(estimate)}")
+                print(f"[Agent] 覆盖策略: {format_plan_summary(plan)}")
+            if remaining <= 0:
+                print("[错误] 高德API配额已用尽（本月剩余 0 次），已中止搜索。"
+                      "请提高配额上限（企业认证 50000/月）或更换 Key。")
+                return {"success": False, "error": "高德API配额已用尽，请提高配额上限或更换 Key"}
+        except Exception as e:
+            logger.warning("配额预算检查异常(不影响主流程): %s", e)
 
-            if not search_region:
-                # region 和 city 都为空，用 keyword 全图搜（不传 region）
-                print(f"[Agent] 正在搜索「{keyword}」...")
-                raw_pois = fetch_pois(
-                    api_key=config.AMAP_API_KEY,
-                    keyword=keyword,
-                    region="",
-                )
-            else:
-                print(f"[Agent] 正在搜索区域「{search_region}」的「{keyword}」...")
-                raw_pois = fetch_pois(
-                    api_key=config.AMAP_API_KEY,
-                    keyword=keyword,
-                    region=search_region,
-                )
+        # 3.0 执行分片计划（基础 text + 周边 around/grid，合并去重）
+        raw_pois, anchor_label = execute_plan(keyword, plan, city)
 
-            # 3.1b 降级搜索：如果区县级搜索无结果但 city 存在，用 city 重试
-            if not raw_pois and region and city:
-                print(f"[Agent] 在「{region}」未找到结果，扩大范围至「{city}」搜索...")
-                raw_pois = fetch_pois(
-                    api_key=config.AMAP_API_KEY,
-                    keyword=keyword,
-                    region=city,
-                )
-                if raw_pois:
-                    search_region = city
-                    print(f"[Agent] 已在「{city}」范围找到 {len(raw_pois)} 条结果")
+        # 3.1b 降级搜索：区县/区域无结果但 city 存在，扩大范围至 city 重试（非周边模式，保持原行为）
+        if not raw_pois and not around and region and city:
+            print(f"[Agent] 在「{region}」未找到结果，扩大范围至「{city}」搜索...")
+            raw_pois = fetch_pois(
+                api_key=config.AMAP_API_KEY,
+                keyword=keyword,
+                region=city,
+            )
+            if raw_pois:
+                anchor_label = city
+                print(f"[Agent] 已在「{city}」范围找到 {len(raw_pois)} 条结果")
 
         if not raw_pois:
             msg = f"在「{anchor_label or region}」未找到「{keyword}」相关商家"
@@ -508,7 +680,7 @@ def run(user_input: str) -> Dict[str, Any]:
     流程：
     1. 意图解析（DeepSeek）
     2. 参数校验（缺失则追问）
-    3. fetch_pois -> aggregate_and_clean -> parse_groupbuy_info -> export_to_table
+    3. fetch_pois -> aggregate_and_clean -> 团购标注(已停用) -> export_to_table
     4. 结果汇报
 
     参数：

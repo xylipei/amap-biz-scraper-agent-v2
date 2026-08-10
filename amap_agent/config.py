@@ -75,9 +75,10 @@ def validate_config() -> None:
 AMAP_BASE_URL: str = "https://restapi.amap.com/v3"
 PLACE_TEXT_URL: str = f"{AMAP_BASE_URL}/place/text"
 PLACE_POLYGON_URL: str = f"{AMAP_BASE_URL}/place/polygon"
-PLACE_DETAIL_URL: str = f"{AMAP_BASE_URL}/place/detail"
 PLACE_AROUND_URL: str = f"{AMAP_BASE_URL}/place/around"  # 周边搜索（按点+半径）
 GEOCODE_URL: str = f"{AMAP_BASE_URL}/geocode/geo"          # 地理编码（文本地址转经纬度）
+# 注：PLACE_DETAIL_URL（/place/detail，ID 查询）已随团购检测停用移除——避免单次搜索
+# 数千条 POI 逐店查询打满日配额（详见 amap_agent/groupbuy.py 模块说明）
 
 # --- 请求控制 ---
 REQUEST_INTERVAL: float = 0.2  # 每次请求间隔 200ms，满足 QPS 限制
@@ -87,6 +88,15 @@ PAGE_SIZE: int = 20            # 高德API每页返回条数
 # --- 周边搜索 ---
 AROUND_RADIUS: int = 3000      # 周边搜索默认半径（米），高德上限 50000
 AROUND_PAGE_SIZE: int = 25     # 周边搜索每页条数（高德上限 25）
+
+# --- 自动网格铺点（突破单请求 200 条限制，配合 generate_grid_anchors 使用）---
+GRID_RADIUS: int = 2500        # 相邻网格圆心间距（米），小于 AROUND_RADIUS 保证覆盖重叠
+GRID_N: int = 1                # 网格半边长：0=仅中心点(1x1)，1=3x3(9点)，2=5x5(25点)
+
+# --- 配额预算（本地账本记账；高德不提供剩余配额查询）---
+QUOTA_LIMIT: int = 5000                  # 本月配额上限（个人认证默认 5000 次/月；企业 50000、商业授权 500000 可在设置中调整）
+QUOTA_COST_PER_10K: float = 30.0         # 超量单价（元/万次，官方 30 元/万次）
+QUOTA_FILE: str = os.path.join(_BASE_DIR, "workbench_data", "quota_ledger.json")  # 配额账本
 
 # --- 高德API 错误码 ---
 ERR_QUOTA_EXCEEDED: tuple = ("10003", "10044")  # 配额超限
