@@ -34,8 +34,6 @@ _HEADER_TO_FIELD = {
     "电话": "tel",
     "评分": "rating",
     "POI类型": "type",
-    "是否团购": "groupbuy",
-    "团购链接": "groupbuy_url",
 }
 
 # 内部字段 -> Excel 明细表头（品牌分组明细表用，与源 CSV 列顺序解耦）

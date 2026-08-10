@@ -77,8 +77,6 @@ PLACE_TEXT_URL: str = f"{AMAP_BASE_URL}/place/text"
 PLACE_POLYGON_URL: str = f"{AMAP_BASE_URL}/place/polygon"
 PLACE_AROUND_URL: str = f"{AMAP_BASE_URL}/place/around"  # 周边搜索（按点+半径）
 GEOCODE_URL: str = f"{AMAP_BASE_URL}/geocode/geo"          # 地理编码（文本地址转经纬度）
-# 注：PLACE_DETAIL_URL（/place/detail，ID 查询）已随团购检测停用移除——避免单次搜索
-# 数千条 POI 逐店查询打满日配额（详见 amap_agent/groupbuy.py 模块说明）
 
 # --- 请求控制 ---
 REQUEST_INTERVAL: float = 0.2  # 每次请求间隔 200ms，满足 QPS 限制

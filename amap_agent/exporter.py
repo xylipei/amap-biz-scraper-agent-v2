@@ -63,8 +63,6 @@ def _get_export_fields() -> List[str]:
         "tel",
         "rating",
         "type",
-        "groupbuy",
-        "groupbuy_url",
     ]
 
 
@@ -80,8 +78,6 @@ _FIELD_DISPLAY = {
     "tel": "电话",
     "rating": "评分",
     "type": "POI类型",
-    "groupbuy": "是否团购",
-    "groupbuy_url": "团购链接",
 }
 
 
@@ -102,17 +98,6 @@ def _sanitize_csv_cell(value: str) -> str:
     return value
 
 
-def _format_groupbuy(value: Any) -> str:
-    """把内部团购状态转为可读文本：True→是，False→否，fetch_failed→需人工核验，其余→未检测"""
-    if value is True:
-        return "是"
-    if value is False:
-        return "否"
-    if value == "fetch_failed":
-        return "需人工核验(附链接)"
-    return "未检测"
-
-
 def _prepare_row(item: Dict[str, Any], fields: List[str]) -> Dict[str, Any]:
     """准备导出行：确保所有字段存在，处理中文和特殊字符"""
     row = {}
@@ -123,9 +108,7 @@ def _prepare_row(item: Dict[str, Any], fields: List[str]) -> Dict[str, Any]:
         # 确保字符串类型
         if not isinstance(value, str):
             value = str(value)
-        if field == "groupbuy":
-            value = _format_groupbuy(item.get("groupbuy"))
-        elif field == "collect_year" and not value:
+        if field == "collect_year" and not value:
             # PRD 2.2：高德不提供收录年份，任何来源缺省时兜底返回 N/A（禁止伪造）
             value = "N/A"
         row[field] = _sanitize_csv_cell(value)
@@ -247,7 +230,7 @@ def _export_excel(
     header_row = _display_header(fields)
     ws.append(header_row)
 
-    # 写数据行（复用 _prepare_row：groupbuy 转可读文本 + 公式注入防护）
+    # 写数据行（复用 _prepare_row：公式注入防护）
     for item in data:
         ws.append([_prepare_row(item, fields)[f] for f in fields])
 

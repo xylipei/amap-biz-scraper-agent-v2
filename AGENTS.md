@@ -21,25 +21,23 @@ python -m py_compile <files>      # 语法检查(项目无 lint/测试命令)
 app.py                     Streamlit 前端:组装 "{地址} 周边 {关键词}" 输入 → agent.run() → 展示表格/下载/历史
 main.py                    CLI 入口:setup_logging() + 全局异常兜底,不抛堆栈
 amap_agent/
-  agent.py                 Agent 编排 + DeepSeek 意图解析(run() 主流程:解析→校验→抓取→清洗→团购→导出→汇报)
+  agent.py                 Agent 编排 + DeepSeek 意图解析(run() 主流程:解析→校验→抓取→清洗→导出→汇报;意图解析规则优先+DeepSeek 兜底)
   fetcher.py               高德抓取:fetch_pois(/place/text)、fetch_pois_around(/place/around)、geocode_address(geocode/geo);分页+3次重试+200ms QPS+配额错误码(10003/10044)终止
-  aggregator.py            清洗统一字段、按品牌基础名统计同名门店(括号前)、apply_groupbuy_filter 场景B团购过滤
-  groupbuy.py              团购标注(已停用网络检测):避免 /place/detail ID 查询烧配额,统一返回 fetch_failed+详情链接
+  aggregator.py            清洗统一字段、按品牌基础名统计同名门店(括号前)
   exporter.py              CSV(utf-8-sig)/Excel 导出 + 搜索历史 search_history.csv;公式注入防护
   config.py                环境变量读 Key + URL/常量 + 强制关闭 IPv6(本机 DNS 的 IPv6 不可达)
 ```
 
-执行流水线:`fetch_pois → aggregate_and_clean → _detect_groupbuy(仅标注,无网络请求) → (场景B过滤) → export_to_table`。
+执行流水线:`fetch_pois → aggregate_and_clean → export_to_table`。
 
 ## Conventions
 
 - **密钥**:只从环境变量读(`os.getenv`),任何代码不得出现明文 API Key(PRD 5.1)。
-- **异常隔离**:单个门店团购检测失败不影响整体列表与文件导出(agent.py 中已有 try/except 兜底)。
 - **中文**:docstring/注释/控制台提示全中文;进度提示用 `[进度]`/`[Agent]` 前缀;错误提示 CLI 用 `[ERROR]`(main.py),Agent 内部用 `[错误]`(agent.py)。
 - **导出**:CSV 必须 `utf-8-sig`;文件名 `{区域}_{品类}_{YYYYMMDD}.csv` 存于 `output/`;控制台须提示绝对路径。
-- **字段底线**:高德收录年份固定 `"N/A"`(高德不提供,禁止伪造);团购失败填 `"fetch_failed"` → 表格显示"需人工核验(附链接)"。
+- **字段底线**:高德收录年份固定 `"N/A"`(高德不提供,禁止伪造)。
 - **日志**:`logging.getLogger(__name__)` 每模块一个 logger;`main.py` 写入 `logs/amap_agent_*.log`。
-- **输入路由**:`/` 分隔区域与品类;"团购"是修饰词不是关键词("水果团购"→搜"水果店"+ groupbuy 过滤);"周边/附近/周围"触发 around 周边搜索模式。
+- **输入路由**:`/` 分隔区域与品类;"周边/附近/周围"触发 around 周边搜索模式。
 - **配置**:无依赖注入,模块顶层直接 import config 常量;改动配置后需重启进程。
 
 ## Notes

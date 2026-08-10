@@ -4,12 +4,10 @@
 职责：
 - 调用DeepSeek API解析用户自然语言输入，提取区域、品类、修饰词
 - 处理复合输入场景（场景A/B）
-- 编排任务流程：fetch_pois -> aggregate_and_clean -> 团购标注(已停用网络检测) -> export_to_table
+- 编排任务流程：fetch_pois -> aggregate_and_clean -> export_to_table
 - 统计结果汇报
 
 防跑偏要求（PRD 3.2）：
-- 场景B：自动将"水果团购"修正为"水果店"/"水果超市";团购检测已停用（避免
-  /place/detail ID 查询烧配额），场景B 结果统一标注"需人工核验(附链接)"
 - 缺失核心参数时追问用户
 """
 
@@ -30,7 +28,7 @@ from amap_agent.fetcher import (
     split_anchors,
     generate_grid_anchors,
 )
-from amap_agent.aggregator import aggregate_and_clean, apply_groupbuy_filter
+from amap_agent.aggregator import aggregate_and_clean
 from amap_agent.exporter import export_to_table, save_search_history
 from amap_agent.districts import CITY_DISTRICTS
 
@@ -47,17 +45,13 @@ INTENT_SYSTEM_PROMPT = """你是一个高德地图搜索Agent的意图解析器�
 - "region": 具体区域，**必须只包含区县级或街道级名称**（如"海淀区"、"西湖区"、"闵行区"）。如果用户输入了城市+区县（如"杭州西湖区"），只提取"西湖区"，不要保留城市名。如果无法拆分到区县级，则留空字符串。
 - "city": 城市级名称（如"北京"、"杭州"、"上海"、"深圳"）。如果用户只指定了区县名但没有城市，可以从区县推断所属城市（例如"西湖区"→"杭州"）。如果无法确定则留空字符串。
 - "keyword": 搜索品类关键词（如"咖啡厅"、"星巴克"、"水果超市"）。必须是单独的品类词，不要包含区域或修饰信息。
-- "modifier": 修饰词，可能的值为"groupbuy"（团购相关）或null
 - "anchor": **地点锚点**，周边搜索的中心地点。当用户输入包含"周边"、"附近"、"周围"、"一带"等词，或给出一个具体地点/建筑/机构名并要求搜索该地点周围的商家时，将该地点完整填入（如"南京市鼓楼区政府大楼"、"南京站"、"西湖"）。注意：anchor 是完整的地点描述，可以带城市前缀，与 region（区县级）不同。没有周边搜索意图时填空字符串。
 - "around": 布尔值，是否为周边搜索模式。当 anchor 非空（即用户想搜某地点周边的商家）时为 true，否则为 false。
 
 注意：
-1. 如果用户输入中包含"团购"、"优惠"、"套餐"等修饰词，modifier应设为"groupbuy"
-2. 重要：如果modifier为"groupbuy"，不要将"团购"直接作为keyword的一部分！例如"水果团购" -> keyword应为"水果店"或"水果超市"，modifier为"groupbuy"
-3. 如果输入中包含"/"分隔符（如"上海闵行区/水果超市"），"/"前是区域，"/"后是品类
-4. 如果输入包含多个区域或品类，取最明确的一个
-5. 如果无法识别任何参数，将对应字段设为空字符串或null
-6. 如果"团购"作为独立修饰词出现（如"带团购的水果店"），keyword应为"水果店"，modifier为"groupbuy"
+1. 如果输入中包含"/"分隔符（如"上海闵行区/水果超市"），"/"前是区域，"/"后是品类
+2. 如果输入包含多个区域或品类，取最明确的一个
+3. 如果无法识别任何参数，将对应字段设为空字符串或null
 7. **重要**：正确拆分区域！如"杭州西湖区" -> region="西湖区", city="杭州"；"上海闵行区" -> region="闵行区", city="上海"；"北京" -> region="", city="北京"；"西湖区"（无城市信息）-> region="西湖区", city=""（因为无法确定城市）
 8. **重要**：如果用户没有指定区县，只有城市名（如"北京"、"杭州"），将region设为""，city设为城市名
 9. **重要**：周边搜索模式！**只要输入中出现"周边"、"附近"、"周围"、"一带"等词，around 必须为 true（强规则，即使地点是行政区名也要遵守）**。示例："南京市鼓楼区 周边 水果商超" -> anchor="南京市鼓楼区", around=true, keyword="水果商超"；"水果商超 附近 南京市政府大楼" -> anchor="南京市政府大楼", around=true。将"周边/附近"等词指向的地点完整填入anchor（行政区名也要填入anchor），region可同时保留区县名，city填城市以帮助地理编码。多地点锚点（用顿号、逗号、"和"连接）整体放入anchor字段，如"南京市政府大楼、南京站"。
@@ -65,7 +59,6 @@ INTENT_SYSTEM_PROMPT = """你是一个高德地图搜索Agent的意图解析器�
 
 输出示例：
 {"region": "海淀区", "city": "北京", "keyword": "星巴克", "modifier": null, "anchor": "", "around": false}
-{"region": "闵行区", "city": "上海", "keyword": "水果店", "modifier": "groupbuy", "anchor": "", "around": false}
 {"region": "", "city": "深圳", "keyword": "咖啡厅", "modifier": null, "anchor": "", "around": false}
 {"region": "西湖区", "city": "杭州", "keyword": "火锅", "modifier": null, "anchor": "", "around": false}
 {"region": "", "city": "南京", "keyword": "水果商超", "modifier": null, "anchor": "南京市鼓楼区政府大楼", "around": true}
@@ -146,7 +139,6 @@ def _validate_region(region: str) -> bool:
 
 _REGION_SUFFIX = ("区", "县", "镇", "乡", "街道")
 _AROUND_WORDS = ("周边", "附近", "周围", "一带")
-_GROUPBUY_WORDS = ("团购", "优惠", "套餐")
 
 
 def _infer_city_from_region(region: str) -> str:
@@ -192,8 +184,7 @@ def _parse_intent_rule_based(user_input: str) -> Optional[Dict[str, Any]]:
     规则优先解析常见输入模式（第一性：输入本质是 区域/品类/修饰词 三元组）。
 
     保守原则：只覆盖最明确的模式（"/"分隔、区域+品类、周边模式）；
-    需要常识映射（如"水果团购"→"水果店"）或区域无法可靠判定时返回 None，
-    回退 DeepSeek，避免误判区域/品类造成搜索偏差。
+    区域无法可靠判定时返回 None，回退 DeepSeek，避免误判区域/品类造成搜索偏差。
 
     返回：
         与 _call_deepseek_intent 同结构的意图字典；无法可靠解析时返回 None
@@ -203,10 +194,6 @@ def _parse_intent_rule_based(user_input: str) -> Optional[Dict[str, Any]]:
         return None
 
     around = any(w in text for w in _AROUND_WORDS)
-    modifier = "groupbuy" if any(w in text for w in _GROUPBUY_WORDS) else None
-    if modifier:
-        # "水果团购"→"水果店"属常识映射，规则不做，交给 LLM
-        return None
 
     keyword = ""
     region = ""
@@ -267,7 +254,6 @@ def _parse_intent_rule_based(user_input: str) -> Optional[Dict[str, Any]]:
         "region": region,
         "city": city,
         "keyword": keyword,
-        "modifier": modifier,
         "anchor": anchor,
         "around": around,
     }
@@ -574,35 +560,7 @@ def _fetch_grid_around_pois(
     return deduped, city
 
 
-def _detect_groupbuy(cleaned_data: List[Dict[str, Any]]) -> Tuple[int, int]:
-    """
-    团购状态标注（已停用网络检测）。
 
-    原实现逐店调用高德 /place/detail（ID 查询），单次搜索数千条 POI 即消耗
-    数千次配额（实测一次搜索 4860 次直接打满日额度）。团购字段对业务非关键，
-    已停用网络检测：统一标注 "fetch_failed"，表格显示"需人工核验(附链接)"。
-
-    参数：
-        cleaned_data: aggregate_and_clean 的输出列表（含 id / detail_url 内部字段）
-
-    返回：
-        (有团购商家数, 需人工核验商家数) —— 恒为 (0, len(cleaned_data))
-    """
-    total = len(cleaned_data)
-    for item in cleaned_data:
-        poi_id = item.get("id", "")
-        detail_url = item.get("detail_url", "")
-        # around 接口不返回 detail_url，按固定格式构造详情页 URL 供人工核验
-        if not detail_url and poi_id:
-            detail_url = f"https://ditu.amap.com/detail/{poi_id}"
-            item["detail_url"] = detail_url
-        item["groupbuy"] = "fetch_failed"
-        item["groupbuy_url"] = detail_url
-
-    if total:
-        print(f"[Agent] 团购检测已停用：{total} 家商家统一标注「需人工核验(附链接)」")
-    logger.info("团购检测（已停用）: %d 家商家统一标注 fetch_failed", total)
-    return 0, total
 
 
 
@@ -706,16 +664,7 @@ def run_with_intent(intent: Dict[str, Any], user_input: str = "") -> Dict[str, A
         print(f"[Agent] 正在清洗和聚合数据（共 {len(raw_pois)} 条原始数据）...")
         cleaned_data = aggregate_and_clean(raw_pois)
 
-        # 3.3 团购检测（PRD 2.2：填充"是否团购"字段，所有场景均检测）
-        groupbuy_count, fetch_failed_count = _detect_groupbuy(cleaned_data)
-
-        # 3.3b 场景B强制过滤（PRD 3.2）：modifier=groupbuy 时剔除无团购商家
-        if modifier == "groupbuy":
-            before_count = len(cleaned_data)
-            cleaned_data = apply_groupbuy_filter(cleaned_data)
-            print(f"[Agent] 场景B过滤: {before_count} -> {len(cleaned_data)} 家（已剔除无团购商家）")
-
-        # 3.3c 统计有评分的商家数
+        # 3.3 统计有评分的商家数
         rating_count = sum(1 for item in cleaned_data if item.get("rating"))
         print(f"[进度] 数据清洗完成: 共 {len(cleaned_data)} 家, 其中有评分 {rating_count} 家")
 
@@ -732,13 +681,10 @@ def run_with_intent(intent: Dict[str, Any], user_input: str = "") -> Dict[str, A
         statistics = {
             "total": len(cleaned_data),
             "rating_count": rating_count,
-            "groupbuy_count": groupbuy_count,
-            "fetch_failed_count": fetch_failed_count,
         }
 
-        logger.info("执行完成: 共 %d 条, 有评分 %d 家, 有团购 %d 家, 需核验 %d 家",
-                     statistics["total"], statistics["rating_count"],
-                     groupbuy_count, fetch_failed_count)
+        logger.info("执行完成: 共 %d 条, 有评分 %d 家",
+                     statistics["total"], statistics["rating_count"])
 
         search_mode_desc = (
             f"   - 搜索方式: 双通道（行政区基础搜索 + 周边搜索 半径{config.AROUND_RADIUS}米，已合并去重）\n"
@@ -752,8 +698,6 @@ def run_with_intent(intent: Dict[str, Any], user_input: str = "") -> Dict[str, A
             f"{search_mode_desc}"
             f"   - 共获取: {statistics['total']} 家商家\n"
             f"   - 其中有评分: {statistics['rating_count']} 家\n"
-            f"   - 有团购商家: {groupbuy_count} 家\n"
-            f"   - 需人工核验: {fetch_failed_count} 家\n"
             f"   - 文件保存至: {file_path}\n"
             f"{'='*50}"
         )
@@ -809,7 +753,7 @@ def run(user_input: str) -> Dict[str, Any]:
     流程：
     1. 意图解析（DeepSeek）
     2. 参数校验（缺失则追问）
-    3. fetch_pois -> aggregate_and_clean -> 团购标注(已停用) -> export_to_table
+    3. fetch_pois -> aggregate_and_clean -> export_to_table
     4. 结果汇报
 
     参数：

@@ -8,7 +8,6 @@ CLI入口 - 高德地图区域商家信息抓取Agent
 
 示例：
     python main.py 北京海淀区 星巴克
-    python main.py 上海闵行区/水果团购
 
 防跑偏要求（PRD 5.3）：
 - 配置日志模块，记录关键节点

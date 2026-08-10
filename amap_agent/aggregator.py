@@ -4,12 +4,10 @@
 职责：
 - 清洗原始JSON数据，提取统一结构字段
 - 统计同名门店数量
-- 按团购字段过滤（场景B逻辑）
 - 处理空值，确保输出字典结构一致
 
 防跑偏要求（PRD 4.1）：
 - 处理空值，确保输出字典结构一致
-- 若触发了场景B逻辑，根据团购字段过滤无效数据
 """
 
 import logging
@@ -93,9 +91,6 @@ def aggregate_and_clean(
         - tel: 电话
         - rating: 评分（来自高德 biz_ext.rating，可能为空）
         - type: POI类型
-        - groupbuy: 团购状态（清洗阶段为空串，由团购检测步骤填充）
-        - groupbuy_url: 商户详情页链接（团购检测用）
-        - id / detail_url: 内部字段（不导出，团购检测用）
     """
     if not raw_pois_list:
         logger.info("原始POI列表为空，返回空结果")
@@ -121,14 +116,9 @@ def aggregate_and_clean(
             "tel": _extract_field(poi, "tel"),
             "rating": _extract_rating(poi),
             "type": _extract_field(poi, "type"),
-            # 团购字段：清洗阶段为空，由 agent 的团购检测步骤填充
-            "groupbuy": "",
-            "groupbuy_url": "",
-            # 内部字段（不导出，团购检测用）
+            # 内部字段（不导出）
             "adcode": _extract_field(poi, "adcode"),
             "id": _extract_field(poi, "id"),
-            # 高德接口字段名不统一（detail_url / detailUrl），兼容两者
-            "detail_url": _extract_field(poi, "detail_url") or _extract_field(poi, "detailUrl"),
         }
         cleaned_list.append(cleaned_item)
 
@@ -157,27 +147,3 @@ def aggregate_and_clean(
         len(cleaned_list),
     )
     return cleaned_list
-
-
-def apply_groupbuy_filter(cleaned_data: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """
-    场景B过滤（PRD 3.2）：仅保留有团购活动（groupbuy=True）或
-    因反爬需人工核验（groupbuy="fetch_failed"）的商家，剔除明确无团购的商家。
-
-    参数：
-        cleaned_data: 已完成团购检测的数据列表（item["groupbuy"] 已被填充）
-
-    返回：
-        过滤后的数据列表
-    """
-    kept: List[Dict[str, Any]] = []
-    removed = 0
-    for item in cleaned_data:
-        gb = item.get("groupbuy")
-        if gb is True or gb == "fetch_failed":
-            kept.append(item)
-        else:
-            removed += 1
-
-    logger.info("场景B过滤: 保留 %d 家, 剔除无团购 %d 家", len(kept), removed)
-    return kept
