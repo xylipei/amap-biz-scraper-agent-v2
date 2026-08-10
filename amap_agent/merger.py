@@ -6,7 +6,8 @@
 - 按 (门店名称, 地址) 联合去重（防止同名不同址的分店被误删）
 - 品牌识别：取店铺名称括号前文本作为品牌名（与 aggregator._extract_base_name 规则一致）
 - 全局重算「同名门店数量」，按品牌门店数降序排序
-- 导出 Excel 品牌分组明细表（品牌名/门店数合并单元格 + 品牌序号）
+- 导出 Excel 品牌分组明细表（对齐交付模板「品牌门店统计」：品牌名/门店数合并单元格
+  + 品牌序号，列含城市/区县/来源地铁站；来源地铁站从地址文本提取）
 
 供 merge_brands.py CLI 与 merge-center-results skill 调用。
 """
@@ -38,29 +39,50 @@ _HEADER_TO_FIELD = {
 }
 
 # 内部字段 -> Excel 明细表头（品牌分组明细表用，与源 CSV 列顺序解耦）
+# 列结构对齐交付模板「品牌门店统计」：序号/品牌名称/同名门店数量/门店名称/城市/区县/地址/电话/来源地铁站
 _BRAND_TABLE_HEADERS = [
     "序号",
-    "品牌名",
+    "品牌名称",
     "同名门店数量",
     "门店名称",
+    "城市",
+    "区县",
     "地址",
     "电话",
-    "评分",
-    "是否团购",
-    "团购链接",
+    "来源地铁站",
 ]
 
 # 明细列：源字段 key -> 内部字段
 _BRAND_DETAIL_FIELDS = [
     "name",
+    "cityname",
+    "adname",
     "address",
     "tel",
-    "rating",
-    "groupbuy",
-    "groupbuy_url",
+    "metro",
 ]
 
+# 列宽（对齐交付模板，单位：字符）
+_TEMPLATE_COL_WIDTHS = {1: 8, 2: 18, 3: 14, 4: 32, 5: 8, 6: 10, 7: 50, 8: 20, 9: 18}
+
 _DEFAULT_OUTPUT_NAME = "merged_brands_{date}.xlsx"
+
+
+# 来源地铁站提取：匹配地址文本中的「XX地铁站」
+_METRO_RE = re.compile(r"([\u4e00-\u9fa5A-Za-z0-9]{1,12}地铁站)")
+
+
+def _extract_metro(address: str) -> str:
+    """
+    从地址文本提取最近地铁站（交付模板「来源地铁站」列）。
+
+    如 "新姚家巷22号(夫子庙地铁站7号口步行150米)" -> "夫子庙地铁站"；
+    匹配不到返回空串。
+    """
+    if not address:
+        return ""
+    m = _METRO_RE.search(address)
+    return m.group(1) if m else ""
 
 
 def _strip_formula_prefix(value: str) -> str:
@@ -265,6 +287,8 @@ def aggregate_by_brand(
 
     for rec in records:
         rec["brand"] = extract_brand(rec.get("name", ""))
+        # 来源地铁站：从地址文本提取（交付模板列）
+        rec["metro"] = _extract_metro(rec.get("address", ""))
 
     # 过滤无品牌名的记录（空门店名），避免产生 rank=0 的伪品牌块与空品牌计数
     before = len(records)
@@ -301,20 +325,17 @@ def aggregate_by_brand(
 
 
 def _style_header(ws, col_count: int) -> None:
-    """表头加粗 + 灰底 + 居中 + 边框"""
-    from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
+    """表头样式：加粗 + 蓝灰底(D9E1F2) + 居中换行（对齐交付模板，无边框）"""
+    from openpyxl.styles import Alignment, Font, PatternFill
 
-    fill = PatternFill("solid", fgColor="D9E1F2")
+    fill = PatternFill("solid", fgColor="FFD9E1F2")  # 8 位 hex，与交付模板表头填充一致
     font = Font(bold=True)
-    align = Alignment(horizontal="center", vertical="center")
-    thin = Side(style="thin", color="999999")
-    border = Border(left=thin, right=thin, top=thin, bottom=thin)
+    align = Alignment(horizontal="center", vertical="center", wrap_text=True)
     for col in range(1, col_count + 1):
         cell = ws.cell(row=1, column=col)
         cell.fill = fill
         cell.font = font
         cell.alignment = align
-        cell.border = border
 
 
 def export_brand_grouped_excel(
@@ -324,11 +345,10 @@ def export_brand_grouped_excel(
     """
     导出品牌分组明细表 Excel。
 
-    布局（品牌分组明细表）：
-        - 第 1 列：品牌序号（品牌排名）
-        - 第 2 列：品牌名（同品牌行垂直合并单元格）
-        - 第 3 列：同名门店数量（同品牌行垂直合并单元格）
-        - 第 4 列起：门店明细（门店名称/地址/电话/评分/是否团购/团购链接）
+    布局（对齐交付模板「品牌门店统计」）：
+        - 第 1-3 列：品牌序号 / 品牌名称 / 同名门店数量（同品牌行垂直合并单元格）
+        - 第 4 列起：门店明细（门店名称/城市/区县/地址/电话/来源地铁站）
+        - 样式：表头加粗灰底居中；表头行高 25、数据行高 15；固定列宽（对齐模板）
 
     参数：
         records: aggregate_by_brand 后的记录列表
@@ -338,7 +358,7 @@ def export_brand_grouped_excel(
         输出文件绝对路径
     """
     from openpyxl import Workbook
-    from openpyxl.styles import Alignment, Border, Font, Side
+    from openpyxl.styles import Alignment
     from openpyxl.utils import get_column_letter
 
     if not records:
@@ -352,16 +372,15 @@ def export_brand_grouped_excel(
 
     wb = Workbook()
     ws = wb.active
-    ws.title = "品牌汇总明细"
+    ws.title = "品牌门店统计"
 
     header_row = _BRAND_TABLE_HEADERS
     ws.append(header_row)
     _style_header(ws, len(header_row))
+    ws.row_dimensions[1].height = 25  # 表头行高（对齐模板）
 
-    thin = Side(style="thin", color="999999")
-    border = Border(left=thin, right=thin, top=thin, bottom=thin)
-    center = Alignment(horizontal="center", vertical="center")
-    left = Alignment(horizontal="left", vertical="center", wrap_text=False)
+    center = Alignment(horizontal="center", vertical="center", wrap_text=True)
+    left = Alignment(horizontal="left", vertical="center", wrap_text=True)
 
     # 按品牌分组（aggregate_by_brand 已按 brand 排序）
     row_idx = 2
@@ -375,7 +394,7 @@ def export_brand_grouped_excel(
             j += 1
         block_len = j - i
 
-        # 品牌块首行写 序号/品牌名/门店数，随后合并单元格
+        # 品牌块首行写 序号/品牌名/门店数，随后垂直合并
         start_row = row_idx
         ws.cell(row=row_idx, column=1, value=rec.get("brand_rank", ""))
         ws.cell(row=row_idx, column=2, value=brand)
@@ -389,28 +408,22 @@ def export_brand_grouped_excel(
                     end_column=col,
                 )
             ws.cell(row=start_row, column=col).alignment = center
-            ws.cell(row=start_row, column=col).border = border
 
-        # 明细列逐店写
+        # 明细列逐店写（对齐模板：城市/区县居中，其余左对齐）
         for k in range(i, j):
             detail = records[k]
             col = 4
             for field in _BRAND_DETAIL_FIELDS:
                 cell = ws.cell(row=row_idx, column=col, value=_safe_cell_value(detail.get(field, "")))
-                cell.border = border
-                cell.alignment = left if field in ("name", "address", "groupbuy_url") else center
+                cell.alignment = center if col in (5, 6) else left
                 col += 1
+            ws.row_dimensions[row_idx].height = 15  # 数据行高（对齐模板）
             row_idx += 1
         i = j
 
-    # 列宽自适应
-    for col_idx in range(1, len(header_row) + 1):
-        max_len = len(str(header_row[col_idx - 1]))
-        for row in ws.iter_rows(min_col=col_idx, max_col=col_idx, values_only=True):
-            for cell_value in row:
-                if cell_value is not None:
-                    max_len = max(max_len, min(len(str(cell_value)), 60))
-        ws.column_dimensions[get_column_letter(col_idx)].width = max_len + 2
+    # 固定列宽（对齐模板，替换原自适应算法）
+    for col_idx, width in _TEMPLATE_COL_WIDTHS.items():
+        ws.column_dimensions[get_column_letter(col_idx)].width = width
 
     wb.save(output_path)
     logger.info("Excel 已保存: %s (%d 行)", output_path, len(records))
