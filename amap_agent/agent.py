@@ -144,6 +144,135 @@ def _validate_region(region: str) -> bool:
     return bool(_REGION_PATTERN.match(region))
 
 
+_REGION_SUFFIX = ("区", "县", "镇", "乡", "街道")
+_AROUND_WORDS = ("周边", "附近", "周围", "一带")
+_GROUPBUY_WORDS = ("团购", "优惠", "套餐")
+
+
+def _infer_city_from_region(region: str) -> str:
+    """从区县级名称推断所属城市（基于内置区县表；"北京海淀区"取城市前缀）。"""
+    for city in CITY_DISTRICTS:
+        if region.startswith(city):
+            return city
+    for city, districts in CITY_DISTRICTS.items():
+        if region in districts:
+            return city
+    return ""
+
+
+def _split_region_city(area: str) -> Tuple[str, str]:
+    """
+    区域文本 → (region, city)，与 LLM 意图字段语义一致。
+
+    - "北京海淀区" -> ("海淀区", "北京")
+    - "海淀区"     -> ("海淀区", 反查城市或 "")
+    - "南京"/"南京市" -> ("", "南京")（须在内置城市表内，表外回退 LLM）
+    - 其他（如"南京站"具体地名）-> ("", "") 表示无法可靠判定
+    """
+    area = area.strip()
+    if not area:
+        return "", ""
+    if area.endswith(_REGION_SUFFIX):
+        region = area
+        city = _infer_city_from_region(area)
+        if city and region.startswith(city):
+            rest = region[len(city):]
+            rest = rest[1:] if rest.startswith("市") else rest
+            if rest.endswith(_REGION_SUFFIX):
+                region = rest
+        return region, city
+    city = area[:-1] if area.endswith("市") else area
+    if city in CITY_DISTRICTS:
+        return "", city
+    return "", ""
+
+
+def _parse_intent_rule_based(user_input: str) -> Optional[Dict[str, Any]]:
+    """
+    规则优先解析常见输入模式（第一性：输入本质是 区域/品类/修饰词 三元组）。
+
+    保守原则：只覆盖最明确的模式（"/"分隔、区域+品类、周边模式）；
+    需要常识映射（如"水果团购"→"水果店"）或区域无法可靠判定时返回 None，
+    回退 DeepSeek，避免误判区域/品类造成搜索偏差。
+
+    返回：
+        与 _call_deepseek_intent 同结构的意图字典；无法可靠解析时返回 None
+    """
+    text = user_input.strip()
+    if not text:
+        return None
+
+    around = any(w in text for w in _AROUND_WORDS)
+    modifier = "groupbuy" if any(w in text for w in _GROUPBUY_WORDS) else None
+    if modifier:
+        # "水果团购"→"水果店"属常识映射，规则不做，交给 LLM
+        return None
+
+    keyword = ""
+    region = ""
+    city = ""
+    anchor = ""
+
+    if "/" in text:
+        # 分隔符模式：区域/品类
+        parts = [p.strip() for p in text.split("/") if p.strip()]
+        if len(parts) != 2:
+            return None
+        area, keyword = parts
+        if around:
+            keyword = re.sub("|".join(_AROUND_WORDS), "", keyword).strip()
+        if not keyword:
+            return None
+        region, city = _split_region_city(area)
+        if not region and not city:
+            return None
+        anchor = area if around else ""
+    elif around:
+        # "地点 周边 品类" 或 "品类 附近 地点"（分隔词后允许空格）
+        # 两模式都可能匹配同一输入，用「area 必须是合法地名(区县/城市)」消歧：
+        # 品类词不会被识别为地名，误匹配自然淘汰；多候选取 area 更长者（更可能是完整地点）
+        m_after = re.match(r"^(?P<area>.+?)[周边附近周围一带]+\s*(?P<kw>[\u4e00-\u9fa5A-Za-z0-9]+)$", text)
+        m_before = re.match(r"^(?P<kw>[\u4e00-\u9fa5A-Za-z0-9]+)\s*[周边附近周围一带]+(?P<area>.+)$", text)
+        candidates = []
+        if m_after:
+            r, c = _split_region_city(m_after.group("area").strip())
+            if r or c:
+                candidates.append((m_after, r, c))
+        if m_before:
+            r, c = _split_region_city(m_before.group("area").strip())
+            if r or c:
+                candidates.append((m_before, r, c))
+        if not candidates:
+            return None
+        m, region, city = max(candidates, key=lambda x: len(x[0].group("area")))
+        area = m.group("area").strip()
+        keyword = m.group("kw")
+        anchor = area
+        if not region and not city:
+            return None
+    else:
+        # "区域 品类"：最后一段为品类，前面为区域
+        tokens = text.split()
+        if len(tokens) < 2:
+            return None
+        area = "".join(tokens[:-1])
+        keyword = tokens[-1]
+        region, city = _split_region_city(area)
+        if not region and not city:
+            return None
+
+    if not keyword:
+        return None
+    return {
+        "region": region,
+        "city": city,
+        "keyword": keyword,
+        "modifier": modifier,
+        "anchor": anchor,
+        "around": around,
+    }
+
+
 def _check_missing_params(intent: Dict[str, Any]) -> List[str]:
     """检查缺失的核心参数，返回缺失参数名的列表"""
     missing = []
@@ -701,12 +830,17 @@ def run(user_input: str) -> Dict[str, Any]:
         logger.error("配置验证失败: %s", e)
         return {"success": False, "error": str(e)}
 
-    # 第一步：意图解析
+    # 第一步：意图解析（规则优先，DeepSeek 兜底——第一性：输入本质是 区域/品类/修饰词 三元组）
     logger.info("意图解析: %s", user_input)
     print(f"[Agent] 正在解析您的输入: 「{user_input}」")
 
     try:
-        intent = _call_deepseek_intent(user_input)
+        intent = _parse_intent_rule_based(user_input)
+        if intent:
+            logger.info("规则解析命中: %s", intent)
+        else:
+            print("[Agent] 规则无法可靠解析，调用 DeepSeek 兜底...")
+            intent = _call_deepseek_intent(user_input)
     except RuntimeError as e:
         return {"success": False, "error": str(e)}
 
