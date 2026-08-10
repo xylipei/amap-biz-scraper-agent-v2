@@ -16,11 +16,16 @@
 import streamlit as st
 
 st.set_page_config(
-    page_title="高德商家抓取工作台",
-    page_icon=":earth_asia:",
+    page_title="商家数据工作台",
+    page_icon=":material/storefront:",
     layout="wide",
     initial_sidebar_state="expanded",
 )
+
+# 全局侧边栏品牌区（对所有页面生效）
+with st.sidebar:
+    st.markdown("## 🏬 商家数据工作台")
+    st.caption("高德地图 × DeepSeek 智能抓取")
 
 pages = [
     st.Page("workbench/pages/home.py", title="总览", icon=":material/home:", default=True),

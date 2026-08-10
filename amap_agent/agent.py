@@ -424,7 +424,7 @@ def run_with_intent(intent: Dict[str, Any], user_input: str = "") -> Dict[str, A
             data=cleaned_data,
             region=anchor_label or region,
             keyword=keyword,
-            fmt="csv",
+            fmt="xlsx",
         )
 
         # 第四步：统计汇报

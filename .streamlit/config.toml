@@ -1,0 +1,10 @@
+[theme]
+# 专业商业工具配色:克制蓝白灰,减少视觉噪音
+primaryColor = "#1677FF"
+backgroundColor = "#FFFFFF"
+secondaryBackgroundColor = "#F0F2F5"
+textColor = "#1F2329"
+font = "sans serif"
+
+[browser]
+gatherUsageStats = false

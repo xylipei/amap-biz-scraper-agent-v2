@@ -30,7 +30,8 @@ def collect_csv_files(input_dir: str) -> list:
         return []
     paths = []
     for fname in sorted(os.listdir(input_dir)):
-        if not fname.lower().endswith(".csv"):
+        lower = fname.lower()
+        if not (lower.endswith(".csv") or lower.endswith(".xlsx")):
             continue
         if fname == "search_history.csv" or fname.startswith("merged_brands"):
             continue

@@ -4,7 +4,7 @@
 
 import streamlit as st
 
-st.title(":book: 使用帮助")
+st.title("使用帮助")
 st.caption("三步上手，常见问题一页看完。")
 
 st.subheader("📖 使用步骤")

@@ -75,17 +75,18 @@ def _strip_formula_prefix(value: str) -> str:
 
 def load_csv_files(paths: List[str]) -> List[Dict[str, Any]]:
     """
-    读取多个商家 CSV，统一字段结构。
+    读取多个商家结果文件（CSV 或 xlsx），统一字段结构。
 
     参数：
-        paths: CSV 文件路径列表
+        paths: 结果文件路径列表（.csv / .xlsx 均可）
 
     返回：
         记录字典列表，字段为内部英文 key（name/address/tel/rating/...），
         另附 _source_file 标记来源文件。
 
     说明：
-        - 编码优先 utf-8-sig（兼容 Excel 导出的中文 BOM），失败时回退 gb18030
+        - CSV 编码优先 utf-8-sig（兼容 Excel 导出的中文 BOM），失败时回退 gb18030
+        - xlsx 用 openpyxl 读取首个工作表
         - 未知列忽略；文件缺少「门店名称」或「地址」列时告警并跳过该文件
           （地址列是去重键组成部分，缺失会导致同名不同址分店被误合并）
     """
@@ -94,35 +95,90 @@ def load_csv_files(paths: List[str]) -> List[Dict[str, Any]]:
         if not os.path.exists(path):
             logger.warning("文件不存在，跳过: %s", path)
             continue
+        items = _load_result_file(path)
+        if items is None:
+            continue
+        records.extend(items)
+        logger.info("已读取 %s: %d 条", os.path.basename(path), len(items))
+    return records
+
+
+def _load_result_file(path: str) -> Optional[List[Dict[str, Any]]]:
+    """读取单个结果文件（按扩展名分发），返回内部字段记录列表；失败返回 None"""
+    ext = os.path.splitext(path)[1].lower()
+    if ext == ".xlsx":
+        data = _read_xlsx_rows(path)
+        if data is None:
+            logger.warning("xlsx 文件无法读取，跳过: %s", path)
+            return None
+        header, rows = data
+    else:
         data = _read_csv_with_fallback(path)
         if data is None:
             logger.warning("文件编码无法识别（utf-8/gb18030 均失败），跳过: %s", path)
-            continue
-        reader, fieldnames = data
-        if not fieldnames:
-            logger.warning("空文件，跳过: %s", path)
-            continue
-        # 表头 -> 内部字段映射（未识别的中文表头列丢弃）
-        col_map = {}
-        for header in fieldnames:
-            header = (header or "").strip()
-            if header in _HEADER_TO_FIELD:
-                col_map[header] = _HEADER_TO_FIELD[header]
-        if "name" not in col_map.values():
-            logger.warning("文件缺少「门店名称」列，跳过: %s", path)
-            continue
-        if "address" not in col_map.values():
-            logger.warning("文件缺少「地址」列（去重键组成部分），跳过: %s", path)
-            continue
-        file_count = 0
-        for row in reader:
-            item: Dict[str, Any] = {"_source_file": os.path.basename(path)}
-            for header, field in col_map.items():
-                item[field] = _strip_formula_prefix((row.get(header) or "").strip())
-            records.append(item)
-            file_count += 1
-        logger.info("已读取 %s: %d 条", os.path.basename(path), file_count)
-    return records
+            return None
+        reader, header = data
+        rows = list(reader)
+
+    if not header:
+        logger.warning("空文件，跳过: %s", path)
+        return None
+
+    # 表头 -> 内部字段映射（未识别的中文表头列丢弃）
+    col_map = {}
+    for h in header:
+        h = (h or "").strip()
+        if h in _HEADER_TO_FIELD:
+            col_map[h] = _HEADER_TO_FIELD[h]
+    if "name" not in col_map.values():
+        logger.warning("文件缺少「门店名称」列，跳过: %s", path)
+        return None
+    if "address" not in col_map.values():
+        logger.warning("文件缺少「地址」列（去重键组成部分），跳过: %s", path)
+        return None
+
+    items: List[Dict[str, Any]] = []
+    for row in rows:
+        item: Dict[str, Any] = {"_source_file": os.path.basename(path)}
+        for header_name, field in col_map.items():
+            raw = row.get(header_name) if isinstance(row, dict) else None
+            item[field] = _strip_formula_prefix((raw or "").strip())
+        items.append(item)
+    return items
+
+
+def _read_xlsx_rows(path: str):
+    """
+    读取 xlsx 首个工作表，返回 (中文表头列表, 行字典列表)。
+
+    返回：
+        (header, rows)；读取失败返回 None
+    """
+    try:
+        from openpyxl import load_workbook
+
+        wb = load_workbook(path, read_only=True, data_only=True)
+        try:
+            ws = wb.active
+            rows_iter = ws.iter_rows(values_only=True)
+            try:
+                header = next(rows_iter)
+            except StopIteration:
+                return [], []
+            header = [str(h).strip() if h is not None else "" for h in header]
+            row_dicts = []
+            for values in rows_iter:
+                row = {}
+                for i, h in enumerate(header):
+                    v = values[i] if i < len(values) else None
+                    row[h] = "" if v is None else str(v)
+                row_dicts.append(row)
+            return header, row_dicts
+        finally:
+            wb.close()
+    except Exception as e:
+        logger.warning("读取 xlsx 失败: %s (%s)", path, e)
+        return None
 
 
 def _read_csv_with_fallback(path: str):

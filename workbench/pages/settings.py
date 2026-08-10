@@ -13,42 +13,44 @@ current = state.load_api_keys()
 amap_ok = bool(current.get("amap"))
 deepseek_ok = bool(current.get("deepseek"))
 
-# ── 配置状态回显（保存后经 st.rerun 刷新，保持与 .env 一致） ──
-st.subheader("当前配置状态")
-c1, c2 = st.columns(2)
-with c1:
-    if amap_ok:
-        st.success("✅ 高德地图 Key 已配置")
-    else:
-        st.error("❌ 高德地图 Key 未配置")
-with c2:
-    if deepseek_ok:
-        st.success("✅ DeepSeek Key 已配置")
-    else:
-        st.error("❌ DeepSeek Key 未配置")
+# ── 配置状态回显（卡片化） ──
+with st.container(border=True):
+    st.markdown("#### 当前配置状态")
+    c1, c2 = st.columns(2)
+    with c1:
+        if amap_ok:
+            st.success("✅ 高德地图 Key 已配置")
+        else:
+            st.error("❌ 高德地图 Key 未配置")
+    with c2:
+        if deepseek_ok:
+            st.success("✅ DeepSeek Key 已配置")
+        else:
+            st.error("❌ DeepSeek Key 未配置")
 
 st.divider()
 
-# ── 填写 / 更新 ──
-with st.form("api_key_form"):
-    st.subheader("填写 / 更新 API Key")
-    st.text_input(
-        "高德地图 API Key",
-        value=current.get("amap", ""),
-        placeholder="请输入高德 Web 服务 Key（console.amap.com 申请）",
-        type="password",
-        key="amap_key_input",
-        help="已配置时显示为密码点；如需更新直接覆盖后保存。",
-    )
-    st.text_input(
-        "DeepSeek API Key",
-        value=current.get("deepseek", ""),
-        placeholder="请输入 DeepSeek API Key（platform.deepseek.com 申请）",
-        type="password",
-        key="deepseek_key_input",
-        help="已配置时显示为密码点；如需更新直接覆盖后保存。",
-    )
-    submitted = st.form_submit_button("保存 Key", type="primary")
+# ── 填写 / 更新（卡片化） ──
+with st.container(border=True):
+    with st.form("api_key_form"):
+        st.markdown("#### 填写 / 更新 API Key")
+        st.text_input(
+            "高德地图 API Key",
+            value=current.get("amap", ""),
+            placeholder="请输入高德 Web 服务 Key（console.amap.com 申请）",
+            type="password",
+            key="amap_key_input",
+            help="已配置时显示为密码点；如需更新直接覆盖后保存。",
+        )
+        st.text_input(
+            "DeepSeek API Key",
+            value=current.get("deepseek", ""),
+            placeholder="请输入 DeepSeek API Key（platform.deepseek.com 申请）",
+            type="password",
+            key="deepseek_key_input",
+            help="已配置时显示为密码点；如需更新直接覆盖后保存。",
+        )
+        submitted = st.form_submit_button("保存 Key", type="primary")
 
 if submitted:
     amap_val = st.session_state.get("amap_key_input", "").strip()
