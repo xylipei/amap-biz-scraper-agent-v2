@@ -27,8 +27,11 @@ if os.getenv("AMAP_AGENT_NO_PROXY", "1") != "0":
     os.environ["NO_PROXY"] = "*"
     os.environ["no_proxy"] = "*"
 
-# 加载 .env 文件（仅开发环境）
-load_dotenv()
+# 加载 .env 文件（基于项目根目录显式定位，避免 Streamlit 工作目录变化时
+# load_dotenv() 从 os.getcwd() 向上找不到 .env，导致 Key 读不到）
+# 注意：本文件位于 amap_agent/ 下，dirname 两次即为项目根目录（与 workbench/state.py 的 ENV_FILE 推导一致）
+_BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+load_dotenv(os.path.join(_BASE_DIR, ".env"))
 
 # --- API 密钥 ---
 AMAP_API_KEY: str = os.getenv("AMAP_API_KEY", "")
