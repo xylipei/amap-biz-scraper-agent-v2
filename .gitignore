@@ -7,6 +7,7 @@ output/
 *.xlsx
 .DS_Store
 logs/
+workbench_data/
 .reasonix/
 .workbuddy/
 reasonix.toml

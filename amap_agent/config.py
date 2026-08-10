@@ -19,12 +19,38 @@ logger = logging.getLogger(__name__)
 import urllib3.util.connection as _urllib3_connection
 _urllib3_connection.HAS_IPV6 = False
 
+# 禁用系统/注册表代理：本机存在代理软件（DNS 解析到 fake-ip 段 198.18.x.x），
+# requests 会误读 Windows 注册表系统代理导致 ProxyError('Unable to connect to proxy')。
+# 统一 NO_PROXY=* 让 requests 对所有主机直连（curl 实测 fake-ip 直连可达）。
+# 默认启用；若客户环境必须走企业代理，可在 .env 设置 AMAP_AGENT_NO_PROXY=0 关闭。
+if os.getenv("AMAP_AGENT_NO_PROXY", "1") != "0":
+    os.environ["NO_PROXY"] = "*"
+    os.environ["no_proxy"] = "*"
+
 # 加载 .env 文件（仅开发环境）
 load_dotenv()
 
 # --- API 密钥 ---
 AMAP_API_KEY: str = os.getenv("AMAP_API_KEY", "")
 DEEPSEEK_API_KEY: str = os.getenv("DEEPSEEK_API_KEY", "")
+
+
+def set_api_keys(amap_key: str = None, deepseek_key: str = None) -> None:
+    """
+    运行时更新 API Key（工作台设置页调用，立即对后续请求生效）。
+
+    参数：
+        amap_key: 高德 API Key；None 表示不修改
+        deepseek_key: DeepSeek API Key；None 表示不修改
+    """
+    global AMAP_API_KEY, DEEPSEEK_API_KEY
+    if amap_key is not None:
+        AMAP_API_KEY = amap_key.strip()
+    if deepseek_key is not None:
+        DEEPSEEK_API_KEY = deepseek_key.strip()
+    logger.info("API Key 已更新: amap=%s, deepseek=%s",
+                "已设置" if AMAP_API_KEY else "未设置",
+                "已设置" if DEEPSEEK_API_KEY else "未设置")
 
 
 def validate_config() -> None:

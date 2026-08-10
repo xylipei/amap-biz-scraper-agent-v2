@@ -21,12 +21,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from openai import OpenAI, APIError
 
-from amap_agent.config import (
-    AMAP_API_KEY,
-    DEEPSEEK_API_KEY,
-    AROUND_RADIUS,
-    validate_config,
-)
+from amap_agent import config
 from amap_agent.fetcher import fetch_pois, fetch_pois_around, geocode_address, split_anchors
 from amap_agent.aggregator import aggregate_and_clean, apply_groupbuy_filter
 from amap_agent.groupbuy import parse_groupbuy_info
@@ -84,9 +79,13 @@ def _call_deepseek_intent(user_input: str) -> Dict[str, Any]:
     抛出：
         RuntimeError: API调用失败或解析结果无效时
     """
+    # 禁用 httpx trust_env：本机默认行为 TLS 握手失败(ConnectError: EOF)，
+    # trust_env=False 后走直连可正常访问 api.deepseek.com（已实测）
+    import httpx
     client = OpenAI(
         base_url=DEEPSEEK_BASE_URL,
-        api_key=DEEPSEEK_API_KEY,
+        api_key=config.DEEPSEEK_API_KEY,
+        http_client=httpx.Client(trust_env=False),
     )
 
     try:
@@ -199,22 +198,22 @@ def _fetch_around_pois(
     if not anchors:
         return [], ""
 
-    print(f"[Agent] 周边搜索模式：围绕 {len(anchors)} 个地点搜索「{keyword}」(半径{AROUND_RADIUS}米)...")
+    print(f"[Agent] 周边搜索模式：围绕 {len(anchors)} 个地点搜索「{keyword}」(半径{config.AROUND_RADIUS}米)...")
     logger.info("周边搜索模式: anchors=%s, keyword=%s, city=%s", anchors, keyword, city)
 
     all_pois: List[Dict[str, Any]] = []
     for anchor in anchors:
-        location = geocode_address(AMAP_API_KEY, anchor, city)
+        location = geocode_address(config.AMAP_API_KEY, anchor, city)
         if not location:
             print(f"[警告] 地点「{anchor}」无法解析为坐标，已跳过")
             logger.warning("地理编码失败，跳过锚点: %s", anchor)
             continue
-        print(f"[Agent] 正在搜索「{anchor}」周边 {AROUND_RADIUS} 米内的「{keyword}」...")
+        print(f"[Agent] 正在搜索「{anchor}」周边 {config.AROUND_RADIUS} 米内的「{keyword}」...")
         pois = fetch_pois_around(
-            api_key=AMAP_API_KEY,
+            api_key=config.AMAP_API_KEY,
             location=location,
             keyword=keyword,
-            radius=AROUND_RADIUS,
+            radius=config.AROUND_RADIUS,
         )
         all_pois.extend(pois)
 
@@ -260,7 +259,7 @@ def _detect_groupbuy(cleaned_data: List[Dict[str, Any]]) -> Tuple[int, int]:
             detail_url = f"https://ditu.amap.com/detail/{poi_id}"
             item["detail_url"] = detail_url
         try:
-            result = parse_groupbuy_info(AMAP_API_KEY, poi_id, detail_url)
+            result = parse_groupbuy_info(config.AMAP_API_KEY, poi_id, detail_url)
         except Exception as e:
             # 单条兜底：检测异常不中断整体流程
             logger.warning("团购检测异常 (id=%s): %s", poi_id, e)
@@ -289,55 +288,23 @@ def _detect_groupbuy(cleaned_data: List[Dict[str, Any]]) -> Tuple[int, int]:
 
 
 
-def run(user_input: str) -> Dict[str, Any]:
+def run_with_intent(intent: Dict[str, Any], user_input: str = "") -> Dict[str, Any]:
     """
-    Agent主入口：执行一次完整的商家信息抓取流程。
+    按已解析的结构化 intent 直接执行抓取流程（跳过 DeepSeek 意图解析）。
 
-    流程：
-    1. 意图解析（DeepSeek）
-    2. 参数校验（缺失则追问）
-    3. fetch_pois -> aggregate_and_clean -> parse_groupbuy_info -> export_to_table
-    4. 结果汇报
+    供批量任务等输入已结构化的场景调用，避免为每个中心点重复调用 LLM；
+    run() 内部同样复用本函数。
 
     参数：
-        user_input: 用户的自然语言输入
+        intent: 意图字典（region/city/keyword/modifier/anchor/around）
+        user_input: 原始输入文本（用于搜索历史记录，可为空字符串）
 
     返回：
-        包含执行结果的字典：
-        - success: bool
-        - file_path: 生成文件的绝对路径（可选）
-        - statistics: 统计数据（可选）
-        - error: 错误信息（可选）
-        - ask_for_input: 追问提示（可选）
+        同 run() 的结果字典
     """
-    # 验证配置
-    try:
-        validate_config()
-    except RuntimeError as e:
-        logger.error("配置验证失败: %s", e)
-        return {"success": False, "error": str(e)}
-
-    # 第一步：意图解析
-    logger.info("意图解析: %s", user_input)
-    print(f"[Agent] 正在解析您的输入: 「{user_input}」")
-
-    try:
-        intent = _call_deepseek_intent(user_input)
-    except RuntimeError as e:
-        return {"success": False, "error": str(e)}
-
     region = intent.get("region", "")
     keyword = intent.get("keyword", "")
     modifier = intent.get("modifier")
-
-    # 兜底修正：输入含周边意图词（周边/附近/周围/一带）但 DeepSeek 漏判 around 时，
-    # 用 region（行政区）作为周边中心锚点，确保双通道搜索生效
-    if (not intent.get("around")) and re.search(r"周边|附近|周围|一带", user_input):
-        if not intent.get("anchor") and intent.get("region"):
-            logger.warning("意图解析漏判周边模式，兜底修正: anchor=%s, around=True", intent["region"])
-            intent["anchor"] = intent["region"]
-            intent["around"] = True
-            region = intent.get("region", "")
 
     logger.info("意图解析结果: region=%s, keyword=%s, modifier=%s, anchor=%s, around=%s",
                 region, keyword, modifier, intent.get("anchor", ""), intent.get("around", False))
@@ -367,7 +334,7 @@ def run(user_input: str) -> Dict[str, Any]:
             if base_region:
                 print(f"[Agent] 通道一（基础搜索）：正在搜索区域「{base_region}」的「{keyword}」...")
                 base_pois = fetch_pois(
-                    api_key=AMAP_API_KEY,
+                    api_key=config.AMAP_API_KEY,
                     keyword=keyword,
                     region=base_region,
                 )
@@ -394,14 +361,14 @@ def run(user_input: str) -> Dict[str, Any]:
                 # region 和 city 都为空，用 keyword 全图搜（不传 region）
                 print(f"[Agent] 正在搜索「{keyword}」...")
                 raw_pois = fetch_pois(
-                    api_key=AMAP_API_KEY,
+                    api_key=config.AMAP_API_KEY,
                     keyword=keyword,
                     region="",
                 )
             else:
                 print(f"[Agent] 正在搜索区域「{search_region}」的「{keyword}」...")
                 raw_pois = fetch_pois(
-                    api_key=AMAP_API_KEY,
+                    api_key=config.AMAP_API_KEY,
                     keyword=keyword,
                     region=search_region,
                 )
@@ -410,7 +377,7 @@ def run(user_input: str) -> Dict[str, Any]:
             if not raw_pois and region and city:
                 print(f"[Agent] 在「{region}」未找到结果，扩大范围至「{city}」搜索...")
                 raw_pois = fetch_pois(
-                    api_key=AMAP_API_KEY,
+                    api_key=config.AMAP_API_KEY,
                     keyword=keyword,
                     region=city,
                 )
@@ -473,7 +440,7 @@ def run(user_input: str) -> Dict[str, Any]:
                      groupbuy_count, fetch_failed_count)
 
         search_mode_desc = (
-            f"   - 搜索方式: 双通道（行政区基础搜索 + 周边搜索 半径{AROUND_RADIUS}米，已合并去重）\n"
+            f"   - 搜索方式: 双通道（行政区基础搜索 + 周边搜索 半径{config.AROUND_RADIUS}米，已合并去重）\n"
             if around and anchor_label else ""
         )
         result_msg = (
@@ -532,3 +499,51 @@ def run(user_input: str) -> Dict[str, Any]:
         logger.exception("未预期的错误")
         print(f"[错误] {error_msg}")
         return {"success": False, "error": error_msg}
+
+
+def run(user_input: str) -> Dict[str, Any]:
+    """
+    Agent主入口：执行一次完整的商家信息抓取流程。
+
+    流程：
+    1. 意图解析（DeepSeek）
+    2. 参数校验（缺失则追问）
+    3. fetch_pois -> aggregate_and_clean -> parse_groupbuy_info -> export_to_table
+    4. 结果汇报
+
+    参数：
+        user_input: 用户的自然语言输入
+
+    返回：
+        包含执行结果的字典：
+        - success: bool
+        - file_path: 生成文件的绝对路径（可选）
+        - statistics: 统计数据（可选）
+        - error: 错误信息（可选）
+        - ask_for_input: 追问提示（可选）
+    """
+    # 验证配置
+    try:
+        config.validate_config()
+    except RuntimeError as e:
+        logger.error("配置验证失败: %s", e)
+        return {"success": False, "error": str(e)}
+
+    # 第一步：意图解析
+    logger.info("意图解析: %s", user_input)
+    print(f"[Agent] 正在解析您的输入: 「{user_input}」")
+
+    try:
+        intent = _call_deepseek_intent(user_input)
+    except RuntimeError as e:
+        return {"success": False, "error": str(e)}
+
+    # 兜底修正：输入含周边意图词（周边/附近/周围/一带）但 DeepSeek 漏判 around 时，
+    # 用 region（行政区）作为周边中心锚点，确保双通道搜索生效
+    if (not intent.get("around")) and re.search(r"周边|附近|周围|一带", user_input):
+        if not intent.get("anchor") and intent.get("region"):
+            logger.warning("意图解析漏判周边模式，兜底修正: anchor=%s, around=True", intent["region"])
+            intent["anchor"] = intent["region"]
+            intent["around"] = True
+
+    return run_with_intent(intent, user_input=user_input)
