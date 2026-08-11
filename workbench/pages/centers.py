@@ -88,67 +88,73 @@ with st.container(border=True):
     if not centers:
         st.caption("暂无中心点，请在上方添加或批量导入。")
     else:
+        # ── 批量操作（表格内勾选 + 全选/清空 + 删除选中 + 二次确认） ──
+        st.markdown("在下方表格的 **「选择」** 列勾选中心点，然后点 **删除选中**；勾选所见即所得，删除前有确认防误删。")
+
+        # 选择状态（中心点 id -> bool），data_editor 勾选后同步回这里；
+        # 用 id 作键可避免中心点列表增删后行号错位（防御多会话/外部修改）
+        valid_ids = {c.get("id") for c in centers if c.get("id")}
+        centers_sel = {cid: v for cid, v in st.session_state.get("centers_sel", {}).items() if cid in valid_ids}
+        st.session_state["centers_sel"] = centers_sel
+
+        # on_click 回调在 widget 处理阶段执行，可安全写 session_state；
+        # pop data_editor 的 key 可清空其编辑记录，让「选择」列完全由 centers_sel 决定
+        def _select_all():
+            st.session_state["centers_sel"] = {c.get("id"): True for c in state.load_centers() if c.get("id")}
+            st.session_state.pop("centers_editor", None)
+
+        def _clear_selection():
+            st.session_state["centers_sel"] = {}
+            st.session_state.pop("centers_editor", None)
+
+        a1, a2, a3, a4 = st.columns([1, 1, 3, 2])
+        with a1:
+            st.button("✅ 全选", use_container_width=True, on_click=_select_all, key="btn_select_all")
+        with a2:
+            st.button("🧹 清空", use_container_width=True, on_click=_clear_selection, key="btn_clear_sel")
+
+        # 表格主体（首列「选择」为复选框，其余列只读）
         df = pd.DataFrame([
-            {"序号": i + 1, "中心地址": c.get("name", ""), "搜索品类": c.get("keyword", ""),
+            {"选择": centers_sel.get(c.get("id"), False), "序号": i + 1, "中心地址": c.get("name", ""),
+             "搜索品类": c.get("keyword", ""),
              "搜索半径(米)": c.get("radius") or config.AROUND_RADIUS,
              "启用": "是" if c.get("enabled", True) else "否"}
             for i, c in enumerate(centers)
         ])
-        st.dataframe(df, use_container_width=True, hide_index=True)
-
-        # Excel 导出（用于客户交付）
-        import io as _io
-        _buf = _io.BytesIO()
-        df.to_excel(_buf, index=False, engine="openpyxl")
-        st.download_button(
-            "📤 下载中心点列表 (Excel)",
-            data=_buf.getvalue(),
-            file_name="centers.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        edited = st.data_editor(
+            df,
+            use_container_width=True,
+            hide_index=True,
+            disabled=["序号", "中心地址", "搜索品类", "搜索半径(米)", "启用"],
+            key="centers_editor",
         )
+        # 同步表格勾选回选择状态（行号 -> 中心点 id）
+        for row_idx, changes in (edited.get("edited_rows") or {}).items():
+            if "选择" in changes:
+                cid = centers[int(row_idx)].get("id") if 0 <= int(row_idx) < len(centers) else None
+                if cid:
+                    centers_sel[cid] = bool(changes["选择"])
+        st.session_state["centers_sel"] = centers_sel
 
-        # ── 批量删除（多选/全选 + 二次确认，防误删） ──
-        st.divider()
-        st.markdown("##### 🗑 批量删除")
+        selected_ids = [c.get("id") for c in centers if c.get("id") and centers_sel.get(c.get("id"), False)]
+        n_sel = len(selected_ids)
 
-        # on_click 回调在 widget 处理阶段执行，可安全写 session_state；
-        # 切勿在 multiselect 实例化之后直接给其 key 赋值（会抛 StreamlitAPIException）
-        def _select_all():
-            st.session_state["batch_del_selection"] = [c.get("id") for c in state.load_centers()]
+        with a3:
+            st.caption(f"已选择 {n_sel} 个中心点" if n_sel else "在表格「选择」列勾选要删除的中心点")
+        with a4:
+            if n_sel > 0:
+                if st.button(
+                    f"🗑 删除选中（{n_sel}）", type="secondary",
+                    use_container_width=True, key="btn_del_selected",
+                ):
+                    st.session_state["pending_batch_del"] = selected_ids
+                    st.rerun()
 
-        def _clear_selection():
-            st.session_state["batch_del_selection"] = []
-
-        opts = [
-            (c.get("id"), f"{c.get('name', '')} / {c.get('keyword', '')}（半径 {c.get('radius') or config.AROUND_RADIUS} 米）")
-            for c in centers
-        ]
-        opt_ids = [cid for cid, _ in opts]
-        opt_labels = {cid: label for cid, label in opts}
-
-        d1, d2, d3 = st.columns([3, 1, 1])
-        with d1:
-            selected = st.multiselect(
-                "勾选要删除的中心点（支持全选；删除前有二次确认，防误删）",
-                options=opt_ids,
-                format_func=lambda cid: opt_labels.get(cid, cid),
-                key="batch_del_selection",
-                placeholder="点击选择要删除的中心点…",
-            )
-        with d2:
-            st.button("✅ 全选", use_container_width=True, on_click=_select_all, key="btn_select_all")
-        with d3:
-            st.button("🧹 清空", use_container_width=True, on_click=_clear_selection, key="btn_clear_sel")
-
-        n_sel = len(selected)
-        if n_sel > 0 and st.button(
-            f"🗑 删除选中的 {n_sel} 个中心点", type="secondary", key="btn_del_selected"
-        ):
-            st.session_state["pending_batch_del"] = list(selected)
-            st.rerun()
+        # 二次确认（防误删，数据不可恢复）
         if st.session_state.get("pending_batch_del"):
             pending = st.session_state["pending_batch_del"]
-            pend_names = "\n".join(f"- {opt_labels.get(cid, cid)}" for cid in pending)
+            name_of = {c.get("id"): f"{c.get('name', '')} / {c.get('keyword', '')}" for c in centers}
+            pend_names = "\n".join(f"- {name_of.get(cid, cid)}" for cid in pending)
             st.warning(f"⚠️ 确认删除以下 {len(pending)} 个中心点？此操作不可恢复。\n{pend_names}")
             cc1, cc2 = st.columns(2)
             with cc1:
@@ -164,3 +170,14 @@ with st.container(border=True):
                 if st.button("取消", use_container_width=True, key="btn_cancel_del"):
                     st.session_state.pop("pending_batch_del", None)
                     st.rerun()
+
+        # Excel 导出（用于客户交付，不含「选择」列）
+        import io as _io
+        _buf = _io.BytesIO()
+        df.drop(columns=["选择"]).to_excel(_buf, index=False, engine="openpyxl")
+        st.download_button(
+            "📤 下载中心点列表 (Excel)",
+            data=_buf.getvalue(),
+            file_name="centers.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        )
