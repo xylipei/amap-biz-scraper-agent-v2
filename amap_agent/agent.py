@@ -4,7 +4,7 @@
 职责：
 - 调用DeepSeek API解析用户自然语言输入，提取区域、品类、修饰词
 - 处理复合输入场景（场景A/B）
-- 编排任务流程：fetch_pois -> aggregate_and_clean -> export_to_table
+- 编排任务流程：radius 半径搜索 -> aggregate_and_clean -> export_to_table
 - 统计结果汇报
 
 防跑偏要求（PRD 3.2）：
@@ -22,7 +22,6 @@ from openai import OpenAI, APIError
 
 from amap_agent import config
 from amap_agent.fetcher import (
-    fetch_pois,
     fetch_pois_around,
     geocode_address,
     split_anchors,
@@ -130,14 +129,6 @@ def _call_deepseek_intent(user_input: str) -> Dict[str, Any]:
         error_msg = f"DeepSeek返回解析失败: {e}"
         logger.error(error_msg)
         raise RuntimeError(error_msg) from e
-
-
-_REGION_PATTERN = re.compile(r'^[\u4e00-\u9fa5]{2,}(?:区|县|市|街道|镇|乡)$')
-
-
-def _validate_region(region: str) -> bool:
-    """校验 region 格式：2字以上中文，以区/县/市/街道/镇/乡结尾"""
-    return bool(_REGION_PATTERN.match(region))
 
 
 _REGION_SUFFIX = ("区", "县", "镇", "乡", "街道")
@@ -311,20 +302,13 @@ def _parse_intent_rule_based(user_input: str) -> Optional[Dict[str, Any]]:
 
 
 def _check_missing_params(intent: Dict[str, Any]) -> List[str]:
-    """检查缺失的核心参数，返回缺失参数名的列表"""
+    """检查缺失的核心参数，返回缺失参数名的列表（全量搜索均基于中心点 + 半径）"""
     missing = []
-    if intent.get("around"):
-        # 周边搜索模式：需要地点锚点 + 品类；锚点缺失但给出城市时自动网格铺点（D 方案）
-        if not intent.get("anchor") and not intent.get("city"):
-            missing.append("地点锚点")
-        if not intent.get("keyword"):
-            missing.append("目标品类")
-    else:
-        # 常规模式：需要区域 + 品类
-        if not intent.get("region") and not intent.get("city"):
-            missing.append("目标区域")
-        if not intent.get("keyword"):
-            missing.append("目标品类")
+    # 中心点：锚点(具体地点) / region(区县) / city(城市，自动网格) 任一即可
+    if not (intent.get("anchor") or intent.get("region") or intent.get("city")):
+        missing.append("搜索中心点/区域")
+    if not intent.get("keyword"):
+        missing.append("目标品类")
     return missing
 
 
@@ -373,8 +357,8 @@ def _fetch_around_pois(
     if not anchors:
         return [], ""
 
-    print(f"[Agent] 周边搜索模式：围绕 {len(anchors)} 个地点搜索「{keyword}」(半径{radius}米)...")
-    logger.info("周边搜索模式: anchors=%s, keyword=%s, city=%s, radius=%d", anchors, keyword, city, radius)
+    print(f"[Agent] 严格半径搜索：围绕 {len(anchors)} 个中心点搜索「{keyword}」(半径{radius}米)...")
+    logger.info("严格半径搜索: anchors=%s, keyword=%s, city=%s, radius=%d", anchors, keyword, city, radius)
 
     all_pois: List[Dict[str, Any]] = []
     for anchor in anchors:
@@ -411,70 +395,59 @@ class FetchTask:
     一个抓取单元（分片计划的组成部分，统一三种覆盖策略）。
 
     mode：
-        "text"   - /place/text 搜索：region 为区县/行政区名（可为空=全国）
         "around" - /place/around 搜索：location 为文本锚点（执行时 geocode）
         "grid"   - 自动网格：以 city 为中心铺 (2N+1)x(2N+1) 圆心逐点 around
     """
 
     mode: str
     keyword: str = ""
-    region: str = ""        # text 模式
+    region: str = ""        # 保留字段（text 模式已移除，不再使用）
     location: str = ""      # around 模式（文本锚点）
-    city: str = ""          # grid 模式 / 展示用
-    radius: int = 0          # around 模式半径
+    city: str = ""          # grid 模式 / 地理编码收窄用
+    radius: int = 0          # around/grid 搜索半径（米）
     label: str = ""         # 展示/导出文件名用
 
 
 def build_fetch_plan(intent: Dict[str, Any]) -> List[FetchTask]:
     """
-    意图 → 分片计划（统一区县拆分 B / 自动网格 D / 多锚点覆盖策略）。
+    意图 → 分片计划（仅半径搜索，全部输入统一走严格范围圈内）。
 
-    周边模式为**单通道**：只执行严格半径搜索（around 锚点 / grid 网格），
-    不再叠加行政区基础 text 搜索，避免混入远离中心点的行政区全域数据
-    （半径圈外店铺不会进入结果）。
+    中心点优先级：锚点(具体地点) > region(区县) > city(城市自动网格)：
+    - anchor 非空 → 多锚点 around 单元
+    - 无 anchor 有 region → 以 region 为锚点 around 单元（geocode 定位区域中心）
+    - 无 anchor/region 有 city → grid 网格单元（覆盖城市，突破单请求 200 条上限）
 
-    计划按执行顺序排列：text 单元（非周边）在前，around/grid 单元（周边）在后；
     估算器（estimate_plan_requests）与执行器（execute_plan）共用同一份计划，
     保证“预估多少就执行多少”。
 
     参数：
-        intent: 意图字典（region/city/keyword/around/anchor/radius）
+        intent: 意图字典（region/city/keyword/anchor/radius）
 
     返回：
-        抓取单元列表（FetchTask）
+        抓取单元列表（FetchTask，仅 around/grid）
     """
     keyword = intent.get("keyword", "")
     region = intent.get("region", "") or ""
     city = intent.get("city", "") or ""
-    around = bool(intent.get("around"))
     anchor = intent.get("anchor", "") or ""
     radius = _normalize_radius(intent.get("radius"))
-    districts = CITY_DISTRICTS.get(city) or []
     plan: List[FetchTask] = []
 
-    if around:
-        # 单通道（仅半径搜索）：锚点优先，无锚点但有城市时自动网格
-        if anchor:
-            # 多锚点：每个锚点一个 around 单元（严格 radius 米圈内）
-            plan += [
-                FetchTask("around", keyword=keyword, location=a,
-                          radius=radius, label=a)
-                for a in split_anchors(anchor)
-            ]
-        elif city:
-            # D 方案：自动网格（各网格圆心 radius 米圈内，突破单请求 200 条上限）
-            plan.append(FetchTask("grid", keyword=keyword, city=city, radius=radius, label=city))
-    else:
-        if region:
-            plan.append(FetchTask("text", keyword=keyword, region=region, label=region))
-        elif city and districts:
-            # B 方案：城市级输入拆分逐区县
-            plan += [FetchTask("text", keyword=keyword, region=d, label=d) for d in districts]
-        elif city:
-            # 表外城市（不在 CITY_DISTRICTS）：回退城市级整搜，避免全国检索混入其他城市数据
-            plan.append(FetchTask("text", keyword=keyword, region=city, label=city))
-        else:
-            plan.append(FetchTask("text", keyword=keyword, region="", label=""))
+    if anchor:
+        # 多锚点：每个锚点一个 around 单元（严格 radius 米圈内）
+        plan += [
+            FetchTask("around", keyword=keyword, location=a, city=city,
+                      radius=radius, label=a)
+            for a in split_anchors(anchor)
+        ]
+    elif region:
+        # 区县级/区域输入：以区域为锚点做半径搜索（geocode 定位区域中心）
+        plan.append(FetchTask("around", keyword=keyword, location=region,
+                              city=city, radius=radius, label=region))
+    elif city:
+        # 城市级输入：自动网格铺点（各圆心 radius 米圈内，突破单请求 200 条上限）
+        plan.append(FetchTask("grid", keyword=keyword, city=city,
+                              radius=radius, label=city))
     return plan
 
 
@@ -482,16 +455,13 @@ def estimate_plan_requests(plan: List[FetchTask]) -> int:
     """
     分片计划 → 预估请求数（保守上限口径，与 execute_plan 一一对应）。
 
-    - text：每单元 ≤10 页（200 条 / offset=20）
     - around：每单元 8 页 + 1 次 geocode（文本锚点需解析）
     - grid：每单元 (2N+1)² 圆心 × 8 页 + 1 次城市 geocode
     """
     grid_n = config.GRID_N
     total = 0
     for t in plan:
-        if t.mode == "text":
-            total += 10
-        elif t.mode == "around":
+        if t.mode == "around":
             total += 8 + 1
         elif t.mode == "grid":
             total += (2 * grid_n + 1) ** 2 * 8 + 1
@@ -500,17 +470,14 @@ def estimate_plan_requests(plan: List[FetchTask]) -> int:
 
 def format_plan_summary(plan: List[FetchTask]) -> str:
     """分片计划 → 人类可读摘要（覆盖策略预览，搜索前展示）。"""
-    n_text = sum(1 for t in plan if t.mode == "text")
     n_around = sum(1 for t in plan if t.mode == "around")
     n_grid = sum(1 for t in plan if t.mode == "grid")
     radius = next((t.radius for t in plan if t.radius), 0)
     parts = []
     if radius:
         parts.append(f"半径{radius}米")
-    if n_text:
-        parts.append(f"{n_text} 个行政区/区县")
     if n_around:
-        parts.append(f"{n_around} 个锚点")
+        parts.append(f"{n_around} 个中心点")
     if n_grid:
         parts.append(f"{n_grid} 组网格（{(2 * config.GRID_N + 1) ** 2} 圆心/组）")
     return " + ".join(parts) if parts else "单次搜索"
@@ -518,58 +485,37 @@ def format_plan_summary(plan: List[FetchTask]) -> str:
 
 def execute_plan(keyword: str, plan: List[FetchTask], city: str = "") -> Tuple[List[Dict[str, Any]], str]:
     """
-    按分片计划执行抓取（保持顺序），合并去重。
+    按分片计划执行抓取（保持顺序），合并去重（仅半径搜索单通道）。
 
     参数：
         keyword: 搜索品类关键词
         plan: build_fetch_plan 生成的分片计划
-        city: 城市名（区县拆分时用作导出/展示标签，与旧行为一致）
+        city: 城市名（供地理编码收窄，保留兼容）
 
     返回：
         (去重后的 POI 原始数据列表, 展示/导出用标签)
     """
-    text_pois: List[Dict[str, Any]] = []
     around_pois: List[Dict[str, Any]] = []
     label = ""
 
     for t in plan:
-        if t.mode == "text":
-            if t.region:
-                print(f"[Agent] 正在搜索区域「{t.region}」的「{t.keyword}」...")
-            pois = fetch_pois(api_key=config.AMAP_API_KEY, keyword=t.keyword, region=t.region)
-            if pois:
-                print(f"[进度] 「{t.region or '全国'}」获取 {len(pois)} 条")
-            else:
-                print(f"[进度] 「{t.region or '全国'}」无结果")
-            text_pois.extend(pois)
-            if not label:
-                label = t.label  # text 单元只记录首个标签(区县拆分时末尾统一为 city)
-        elif t.mode == "around":
+        if t.mode == "around":
             pois, lab = _fetch_around_pois(t.keyword, t.location, t.city, t.radius)
             around_pois.extend(pois)
             if lab:
-                label = lab  # 周边锚点标签优先
+                label = lab  # 锚点标签优先
         elif t.mode == "grid":
             pois, lab = _fetch_grid_around_pois(t.keyword, t.city, t.radius)
             around_pois.extend(pois)
             if lab:
-                label = lab  # 网格标签(城市名)优先
+                label = lab  # 网格标签(城市名)
 
-    # 去重（text 与 around 分别收集后统一合并；周边模式为单通道，text_pois 为空）
-    raw_pois = _merge_pois(text_pois, around_pois)
-    if text_pois and around_pois and len(raw_pois) < len(text_pois) + len(around_pois):
-        print(f"[进度] 多通道合并: 基础 {len(text_pois)} + 周边 {len(around_pois)} -> 去重 {len(raw_pois)} 条")
-    elif text_pois and len(raw_pois) < len(text_pois):
-        print(f"[进度] 跨区县去重: {len(text_pois)} -> {len(raw_pois)} 条")
-    elif around_pois and len(raw_pois) < len(around_pois):
-        print(f"[进度] 周边去重: {len(around_pois)} -> {len(raw_pois)} 条")
-
-    # 展示/导出标签：优先周边标签；区县拆分(多 text 单元)且给 city 时统一用城市名
-    text_tasks = [t for t in plan if t.mode == "text"]
-    if len(text_tasks) > 1 and city:
-        label = city
-    elif not label and text_tasks:
-        label = text_tasks[0].region or ""
+    # 去重（按 poi id）
+    raw_pois = _merge_pois(around_pois)
+    if len(raw_pois) < len(around_pois):
+        print(f"[进度] 半径搜索去重: {len(around_pois)} -> {len(raw_pois)} 条")
+    elif not raw_pois and plan:
+        label = plan[0].label
     return raw_pois, label
 
 
@@ -668,13 +614,7 @@ def run_with_intent(intent: Dict[str, Any], user_input: str = "") -> Dict[str, A
         around = bool(intent.get("around"))
         anchor_label = ""
 
-        # 3.0b 校验 region 格式，不符合时降级到 city
-        if not around and region and not _validate_region(region):
-            logger.warning("region 格式异常，降级到 city: region=%s -> city=%s", region, city)
-            region = ""
-            intent["region"] = ""
-
-        # 分片计划：统一区县拆分(B)/自动网格(D)/多锚点覆盖策略，
+        # 分片计划：仅半径搜索（锚点/区县/城市网格），
         # 估算器与执行器共用同一份计划（预估多少就执行多少）
         plan = build_fetch_plan(intent)
 
@@ -695,20 +635,8 @@ def run_with_intent(intent: Dict[str, Any], user_input: str = "") -> Dict[str, A
         except Exception as e:
             logger.warning("配额预算检查异常(不影响主流程): %s", e)
 
-        # 3.0 执行分片计划（基础 text + 周边 around/grid，合并去重）
+        # 3.0 执行分片计划（仅半径搜索 around/grid，合并去重）
         raw_pois, anchor_label = execute_plan(keyword, plan, city)
-
-        # 3.1b 降级搜索：区县/区域无结果但 city 存在，扩大范围至 city 重试（非周边模式，保持原行为）
-        if not raw_pois and not around and region and city:
-            print(f"[Agent] 在「{region}」未找到结果，扩大范围至「{city}」搜索...")
-            raw_pois = fetch_pois(
-                api_key=config.AMAP_API_KEY,
-                keyword=keyword,
-                region=city,
-            )
-            if raw_pois:
-                anchor_label = city
-                print(f"[Agent] 已在「{city}」范围找到 {len(raw_pois)} 条结果")
 
         if not raw_pois:
             msg = f"在「{anchor_label or region}」未找到「{keyword}」相关商家"
@@ -753,8 +681,8 @@ def run_with_intent(intent: Dict[str, Any], user_input: str = "") -> Dict[str, A
                      statistics["total"], statistics["rating_count"])
 
         search_mode_desc = (
-            f"   - 搜索方式: 严格半径搜索（半径 {radius} 米内，单通道，不含行政区全域数据）\n"
-            if around and anchor_label else ""
+            f"   - 搜索方式: 严格半径搜索（半径 {radius} 米内，单通道）\n"
+            if anchor_label else ""
         )
         result_msg = (
             f"\n{'='*50}\n"
@@ -820,7 +748,7 @@ def run(user_input: str) -> Dict[str, Any]:
     流程：
     1. 意图解析（DeepSeek）
     2. 参数校验（缺失则追问）
-    3. fetch_pois -> aggregate_and_clean -> export_to_table
+    3. 半径搜索(around/grid) -> aggregate_and_clean -> export_to_table
     4. 结果汇报
 
     参数：

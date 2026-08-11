@@ -141,6 +141,9 @@ def fetch_pois(
     """
     抓取高德地图指定区域、指定品类的POI数据。
 
+    注意：主流程已统一为严格半径搜索（/place/around），本函数保留作 API 层
+    工具（/place/text 行政区搜索），agent 主链路不再调用。
+
     参数：
         api_key: 高德地图API Key
         keyword: 搜索关键词（如"咖啡厅"、"水果店"）

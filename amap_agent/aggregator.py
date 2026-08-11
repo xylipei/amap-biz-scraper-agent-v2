@@ -77,7 +77,7 @@ def aggregate_and_clean(
     清洗原始POI数据，统计同名门店数量。
 
     参数：
-        raw_pois_list: fetch_pois 返回的原始POI数据列表
+        raw_pois_list: 高德抓取返回的原始POI数据列表
 
     返回：
         统一结构的字典列表，每个字典包含以下字段：
