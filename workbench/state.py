@@ -120,6 +120,22 @@ def remove_center(center_id: str) -> bool:
     return True
 
 
+def remove_centers(center_ids: List[str]) -> int:
+    """批量删除中心点（单次读-改-写），返回实际删除数量。
+
+    不存在的 id 自动忽略；ids 为空时返回 0 不做任何写入。
+    """
+    ids = set(center_ids or [])
+    if not ids:
+        return 0
+    centers = load_centers()
+    remaining = [c for c in centers if c.get("id") not in ids]
+    removed = len(centers) - len(remaining)
+    if removed:
+        save_centers(remaining)
+    return removed
+
+
 # ── 任务 ──
 
 def load_tasks() -> List[Dict[str, Any]]:

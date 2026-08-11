@@ -107,25 +107,60 @@ with st.container(border=True):
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         )
 
-        # ── 删除（二次确认，防误删） ──
+        # ── 批量删除（多选/全选 + 二次确认，防误删） ──
         st.divider()
-        del_opts = {f"{c.get('name')} / {c.get('keyword')}": c.get("id") for c in centers}
-        to_del = st.selectbox("选择要删除的中心点", list(del_opts.keys()))
-        if st.button("🗑 删除所选", type="secondary"):
-            st.session_state["pending_del"] = del_opts[to_del]
+        st.markdown("##### 🗑 批量删除")
+
+        # on_click 回调在 widget 处理阶段执行，可安全写 session_state；
+        # 切勿在 multiselect 实例化之后直接给其 key 赋值（会抛 StreamlitAPIException）
+        def _select_all():
+            st.session_state["batch_del_selection"] = [c.get("id") for c in state.load_centers()]
+
+        def _clear_selection():
+            st.session_state["batch_del_selection"] = []
+
+        opts = [
+            (c.get("id"), f"{c.get('name', '')} / {c.get('keyword', '')}（半径 {c.get('radius') or config.AROUND_RADIUS} 米）")
+            for c in centers
+        ]
+        opt_ids = [cid for cid, _ in opts]
+        opt_labels = {cid: label for cid, label in opts}
+
+        d1, d2, d3 = st.columns([3, 1, 1])
+        with d1:
+            selected = st.multiselect(
+                "勾选要删除的中心点（支持全选；删除前有二次确认，防误删）",
+                options=opt_ids,
+                format_func=lambda cid: opt_labels.get(cid, cid),
+                key="batch_del_selection",
+                placeholder="点击选择要删除的中心点…",
+            )
+        with d2:
+            st.button("✅ 全选", use_container_width=True, on_click=_select_all, key="btn_select_all")
+        with d3:
+            st.button("🧹 清空", use_container_width=True, on_click=_clear_selection, key="btn_clear_sel")
+
+        n_sel = len(selected)
+        if n_sel > 0 and st.button(
+            f"🗑 删除选中的 {n_sel} 个中心点", type="secondary", key="btn_del_selected"
+        ):
+            st.session_state["pending_batch_del"] = list(selected)
             st.rerun()
-        if st.session_state.get("pending_del"):
-            pending = st.session_state["pending_del"]
-            del_name = next((k for k, v in del_opts.items() if v == pending), "")
-            st.warning(f"⚠️ 确认删除「{del_name}」？此操作不可恢复。")
+        if st.session_state.get("pending_batch_del"):
+            pending = st.session_state["pending_batch_del"]
+            pend_names = "\n".join(f"- {opt_labels.get(cid, cid)}" for cid in pending)
+            st.warning(f"⚠️ 确认删除以下 {len(pending)} 个中心点？此操作不可恢复。\n{pend_names}")
             cc1, cc2 = st.columns(2)
             with cc1:
-                if st.button("确认删除", type="primary", use_container_width=True):
-                    state.remove_center(pending)
-                    st.session_state.pop("pending_del", None)
-                    st.success("已删除")
+                if st.button(
+                    "确认删除", type="primary", use_container_width=True,
+                    on_click=_clear_selection, key="btn_confirm_del",
+                ):
+                    removed = state.remove_centers(pending)
+                    st.session_state.pop("pending_batch_del", None)
+                    st.success(f"已删除 {removed} 个中心点")
                     st.rerun()
             with cc2:
-                if st.button("取消", use_container_width=True):
-                    st.session_state.pop("pending_del", None)
+                if st.button("取消", use_container_width=True, key="btn_cancel_del"):
+                    st.session_state.pop("pending_batch_del", None)
                     st.rerun()
