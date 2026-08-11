@@ -8,6 +8,27 @@ import streamlit as st
 from amap_agent import config
 from workbench import state
 
+
+def _sync_selection_from_editor(edited, centers, centers_sel) -> None:
+    """把 st.data_editor 的编辑结果同步到选择状态（以中心点 id 为键）。
+
+    关键：未设 num_rows="dynamic" 时 data_editor 返回**编辑后的 DataFrame**（不是 dict），
+    必须从「选择」列读勾选结果；同时兼容 dict 形态（含 edited_rows），防止未来改动回归。
+    """
+    if isinstance(edited, dict):
+        for row_idx, changes in (edited.get("edited_rows") or {}).items():
+            if "选择" in changes:
+                row = int(row_idx)
+                cid = centers[row].get("id") if 0 <= row < len(centers) else None
+                if cid:
+                    centers_sel[cid] = bool(changes["选择"])
+    else:
+        for i, c in enumerate(centers):
+            cid = c.get("id")
+            if cid and i < len(edited):
+                centers_sel[cid] = bool(edited.iloc[i]["选择"])
+
+
 st.title("中心点管理")
 st.caption("维护批量搜索的中心点列表：每个中心点 = 一个搜索圆心地址 + 目标品类 + 搜索半径(米)。")
 
@@ -129,11 +150,7 @@ with st.container(border=True):
             key="centers_editor",
         )
         # 同步表格勾选回选择状态（行号 -> 中心点 id）
-        for row_idx, changes in (edited.get("edited_rows") or {}).items():
-            if "选择" in changes:
-                cid = centers[int(row_idx)].get("id") if 0 <= int(row_idx) < len(centers) else None
-                if cid:
-                    centers_sel[cid] = bool(changes["选择"])
+        _sync_selection_from_editor(edited, centers, centers_sel)
         st.session_state["centers_sel"] = centers_sel
 
         selected_ids = [c.get("id") for c in centers if c.get("id") and centers_sel.get(c.get("id"), False)]
