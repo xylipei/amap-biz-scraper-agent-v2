@@ -16,6 +16,7 @@ import zipfile
 import pandas as pd
 import streamlit as st
 
+from amap_agent import config
 from amap_agent.merger import run_merge
 from workbench import state
 
@@ -72,7 +73,8 @@ def _render_results():
     # 成功且有文件的结果
     done_items = [
         (i, r) for i, r in enumerate(results)
-        if r.get("status") == "done" and r.get("file_path") and os.path.exists(r.get("file_path", ""))
+        if r.get("status") == "done" and r.get("file_path")
+        and os.path.exists(r.get("file_path") or "")
     ]
 
     # ── 选择下载：表格勾选 + 批量 ZIP + 单行下载 ──
@@ -100,6 +102,7 @@ def _render_results():
                     "勾选": sel_all,
                     "中心点": r.get("name", ""),
                     "品类": r.get("keyword", ""),
+                    "半径(米)": r.get("radius") or config.AROUND_RADIUS,
                     "结果数": r.get("total", 0),
                     "结果文件": os.path.basename(r.get("file_path", "")),
                     "_idx": i,
@@ -170,7 +173,8 @@ def _render_results():
                     )
 
     # ── 汇总下载：合并全部成功结果为一个 Excel ──
-    files = [r.get("file_path") for r in results if r.get("file_path") and os.path.exists(r.get("file_path", ""))]
+    files = [r.get("file_path") for r in results
+             if r.get("file_path") and os.path.exists(r.get("file_path") or "")]
     if files:
         st.divider()
         with st.container(border=True):

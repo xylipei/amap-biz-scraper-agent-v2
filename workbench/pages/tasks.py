@@ -123,6 +123,7 @@ with st.container(border=True):
             st.markdown("**执行结果**")
             res_df = pd.DataFrame([
                 {"中心点": r.get("name"), "品类": r.get("keyword"),
+                 "半径(米)": r.get("radius") or config.AROUND_RADIUS,
                  "状态": "成功" if r.get("status") == "done" else "失败",
                  "结果数": r.get("total", 0), "结果文件": r.get("file_path", "")}
                 for r in results

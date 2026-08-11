@@ -73,7 +73,8 @@ def run_task_sync(
         buf = io.StringIO()
         try:
             with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(buf):
-                # 批量任务输入已结构化，直接构造 intent 跳过 DeepSeek 意图解析
+                # 批量任务输入已结构化，直接构造 intent 跳过 DeepSeek 意图解析；
+                # 半径取中心点配置（缺省由 run_with_intent 回退默认 5km）
                 intent = {
                     "anchor": name,
                     "keyword": keyword,
@@ -81,6 +82,7 @@ def run_task_sync(
                     "region": "",
                     "city": "",
                     "modifier": None,
+                    "radius": center.get("radius") or 0,
                 }
                 result = agent_module.run_with_intent(intent, user_input=f"{name} 周边 {keyword}")
         except Exception as e:  # 单点异常不中断整体任务
@@ -106,6 +108,7 @@ def run_task_sync(
         results.append({
             "name": name,
             "keyword": keyword,
+            "radius": center.get("radius") or 0,
             "status": "done" if ok else "failed",
             "total": total,
             "file_path": file_path,

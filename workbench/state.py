@@ -74,18 +74,22 @@ def save_centers(centers: List[Dict[str, Any]]) -> None:
     _write_json(CENTERS_FILE, centers)
 
 
-def add_center(name: str, keyword: str, enabled: bool = True) -> Dict[str, Any]:
-    """新增中心点（名称+关键字去重校验）"""
+def add_center(name: str, keyword: str, enabled: bool = True, radius: Optional[int] = None) -> Dict[str, Any]:
+    """新增中心点（名称+关键字去重校验）；radius 为周边搜索半径（米），None 表示用全局默认。
+    非 None 时统一 clamp 到 [500, 50000]（与执行链路 _normalize_radius 口径一致，保证存储/展示/执行一致）。"""
     centers = load_centers()
     name = (name or "").strip()
     keyword = (keyword or "").strip()
     for c in centers:
         if c.get("name") == name and c.get("keyword") == keyword:
             raise ValueError(f"中心点已存在: {name} / {keyword}")
+    if radius is not None:
+        radius = max(500, min(int(radius), 50000))
     center = {
         "id": "c_" + uuid.uuid4().hex[:8],
         "name": name,
         "keyword": keyword,
+        "radius": radius,
         "enabled": enabled,
     }
     centers.append(center)
@@ -94,11 +98,11 @@ def add_center(name: str, keyword: str, enabled: bool = True) -> Dict[str, Any]:
 
 
 def update_center(center_id: str, **fields) -> bool:
-    """更新中心点字段（name/keyword/enabled）"""
+    """更新中心点字段（name/keyword/enabled/radius）"""
     centers = load_centers()
     for c in centers:
         if c.get("id") == center_id:
-            for k in ("name", "keyword", "enabled"):
+            for k in ("name", "keyword", "enabled", "radius"):
                 if k in fields:
                     c[k] = fields[k]
             save_centers(centers)
@@ -145,7 +149,10 @@ def create_task(name: str, centers: List[Dict[str, Any]]) -> Dict[str, Any]:
         "status": "pending",  # pending/running/done/partial/failed
         "total": len(centers),
         "current_index": 0,
-        "centers": [{"name": c.get("name", ""), "keyword": c.get("keyword", "")} for c in centers],
+        "centers": [
+            {"name": c.get("name", ""), "keyword": c.get("keyword", ""), "radius": c.get("radius")}
+            for c in centers
+        ],
         "results": [],   # [{name, keyword, status, total, file_path}]
         "logs": [],
         "started_at": "",

@@ -298,7 +298,7 @@ def fetch_pois_around(
         api_key: 高德地图API Key
         location: 中心点经纬度字符串（"经度,纬度"）
         keyword: 搜索关键词（如"水果商超"）
-        radius: 搜索半径（米），默认 AROUND_RADIUS(3000)，最大 50000
+        radius: 搜索半径（米），默认 AROUND_RADIUS(5000)，最大 50000
         max_pages: 最大抓取页数，None表示抓取全部
 
     返回：

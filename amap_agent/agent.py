@@ -47,6 +47,7 @@ INTENT_SYSTEM_PROMPT = """你是一个高德地图搜索Agent的意图解析器�
 - "keyword": 搜索品类关键词（如"咖啡厅"、"星巴克"、"水果超市"）。必须是单独的品类词，不要包含区域或修饰信息。
 - "anchor": **地点锚点**，周边搜索的中心地点。当用户输入包含"周边"、"附近"、"周围"、"一带"等词，或给出一个具体地点/建筑/机构名并要求搜索该地点周围的商家时，将该地点完整填入（如"南京市鼓楼区政府大楼"、"南京站"、"西湖"）。注意：anchor 是完整的地点描述，可以带城市前缀，与 region（区县级）不同。没有周边搜索意图时填空字符串。
 - "around": 布尔值，是否为周边搜索模式。当 anchor 非空（即用户想搜某地点周边的商家）时为 true，否则为 false。
+- "radius": 周边搜索半径，**单位为米（整数）**。当用户明确指定半径时填写（如"5公里内"→5000、"3km"→3000、"500米"→500）；未指定时填 0，由系统使用默认半径。
 
 注意：
 1. 如果输入中包含"/"分隔符（如"上海闵行区/水果超市"），"/"前是区域，"/"后是品类
@@ -58,12 +59,13 @@ INTENT_SYSTEM_PROMPT = """你是一个高德地图搜索Agent的意图解析器�
 10. 周边搜索模式下，如果地点中能识别出城市（如"南京市鼓楼区政府大楼"→南京），city应填"南京"以帮助地理编码收窄范围。
 
 输出示例：
-{"region": "海淀区", "city": "北京", "keyword": "星巴克", "modifier": null, "anchor": "", "around": false}
-{"region": "", "city": "深圳", "keyword": "咖啡厅", "modifier": null, "anchor": "", "around": false}
-{"region": "西湖区", "city": "杭州", "keyword": "火锅", "modifier": null, "anchor": "", "around": false}
-{"region": "", "city": "南京", "keyword": "水果商超", "modifier": null, "anchor": "南京市鼓楼区政府大楼", "around": true}
-{"region": "鼓楼区", "city": "南京", "keyword": "水果商超", "modifier": null, "anchor": "南京市鼓楼区", "around": true}
-{"region": "", "city": "南京", "keyword": "水果商超", "modifier": null, "anchor": "南京市政府大楼、南京站", "around": true}"""
+{"region": "海淀区", "city": "北京", "keyword": "星巴克", "modifier": null, "anchor": "", "around": false, "radius": 0}
+{"region": "", "city": "深圳", "keyword": "咖啡厅", "modifier": null, "anchor": "", "around": false, "radius": 0}
+{"region": "西湖区", "city": "杭州", "keyword": "火锅", "modifier": null, "anchor": "", "around": false, "radius": 0}
+{"region": "", "city": "南京", "keyword": "水果商超", "modifier": null, "anchor": "南京市鼓楼区政府大楼", "around": true, "radius": 0}
+{"region": "", "city": "南京", "keyword": "水果商超", "modifier": null, "anchor": "南京市鼓楼区政府大楼", "around": true, "radius": 3000}
+{"region": "鼓楼区", "city": "南京", "keyword": "水果商超", "modifier": null, "anchor": "南京市鼓楼区", "around": true, "radius": 0}
+{"region": "", "city": "南京", "keyword": "水果商超", "modifier": null, "anchor": "南京市政府大楼、南京站", "around": true, "radius": 0}"""
 
 
 def _call_deepseek_intent(user_input: str) -> Dict[str, Any]:
@@ -116,6 +118,7 @@ def _call_deepseek_intent(user_input: str) -> Dict[str, Any]:
         result.setdefault("modifier", None)
         result.setdefault("anchor", "")
         result.setdefault("around", False)
+        result.setdefault("radius", 0)
 
         return result
 
@@ -139,6 +142,48 @@ def _validate_region(region: str) -> bool:
 
 _REGION_SUFFIX = ("区", "县", "镇", "乡", "街道")
 _AROUND_WORDS = ("周边", "附近", "周围", "一带")
+
+# 半径解析：公里/千米/km 为强信号；"米"需数值≥100 且后不跟常见品类字（避免误伤"米线/米粉"等）
+_RADIUS_KM_RE = re.compile(r"(\d+(?:\.\d+)?)\s*(?:公里|千米|km)", re.IGNORECASE)
+_RADIUS_M_RE = re.compile(r"(\d+(?:\.\d+)?)\s*米")
+_RADIUS_M_AFTER_BLOCK = ("线", "粉", "酒", "店", "饭", "面", "糕", "粥", "团", "皮", "铺", "仓")
+RADIUS_MIN = 500          # 有效半径下限（米），低于此值视为误伤/忽略
+RADIUS_MAX = 50000        # 有效半径上限（米），高德 /place/around 上限
+
+
+def _normalize_radius(radius: Any) -> int:
+    """归一化半径：未指定(0)/非法回退默认 AROUND_RADIUS，clamp 到 [500, 50000]。"""
+    try:
+        r = int(float(radius))
+    except (TypeError, ValueError):
+        return config.AROUND_RADIUS
+    if r <= 0:
+        return config.AROUND_RADIUS
+    return max(RADIUS_MIN, min(r, RADIUS_MAX))
+
+
+def _extract_radius(text: str) -> Tuple[int, str]:
+    """
+    从输入文本提取周边搜索半径（米），并返回移除半径片段后的文本。
+
+    支持："5公里"→5000、"3km"→3000、"2千米"→2000、"500米"→500（"米"需数值≥100）。
+    未识别返回 (0, 原文本)。
+    """
+    t = text.strip()
+    radius = 0
+    for m in _RADIUS_KM_RE.finditer(t):
+        radius = int(round(float(m.group(1)) * 1000))
+        t = t.replace(m.group(0), " ", 1)
+        break
+    if not radius:
+        for m in _RADIUS_M_RE.finditer(t):
+            val = int(round(float(m.group(1))))
+            after = t[m.end():m.end() + 1]
+            if val >= 100 and after not in _RADIUS_M_AFTER_BLOCK:
+                radius = val
+                t = t.replace(m.group(0), " ", 1)
+            break
+    return radius, re.sub(r"\s+", " ", t).strip()
 
 
 def _infer_city_from_region(region: str) -> str:
@@ -190,6 +235,11 @@ def _parse_intent_rule_based(user_input: str) -> Optional[Dict[str, Any]]:
         与 _call_deepseek_intent 同结构的意图字典；无法可靠解析时返回 None
     """
     text = user_input.strip()
+    if not text:
+        return None
+
+    # 先提取半径（如"5公里""3km"），移除后再做区域/品类/周边词解析
+    radius, text = _extract_radius(text)
     if not text:
         return None
 
@@ -256,6 +306,7 @@ def _parse_intent_rule_based(user_input: str) -> Optional[Dict[str, Any]]:
         "keyword": keyword,
         "anchor": anchor,
         "around": around,
+        "radius": radius,
     }
 
 
@@ -304,6 +355,7 @@ def _fetch_around_pois(
     keyword: str,
     anchor_text: str,
     city: str,
+    radius: int = config.AROUND_RADIUS,
 ) -> Tuple[List[Dict[str, Any]], str]:
     """
     周边搜索模式：对每个地点锚点做地理编码 + 周边搜索，按 poi id 去重合并。
@@ -312,6 +364,7 @@ def _fetch_around_pois(
         keyword: 搜索品类关键词
         anchor_text: 地点锚点原文（可含多个地点，用顿号/逗号/和连接）
         city: 城市名（用于收窄地理编码范围，可为空）
+        radius: 搜索半径（米），严格半径圈内数据
 
     返回：
         (去重后的 POI 列表, 展示用锚点名)
@@ -320,8 +373,8 @@ def _fetch_around_pois(
     if not anchors:
         return [], ""
 
-    print(f"[Agent] 周边搜索模式：围绕 {len(anchors)} 个地点搜索「{keyword}」(半径{config.AROUND_RADIUS}米)...")
-    logger.info("周边搜索模式: anchors=%s, keyword=%s, city=%s", anchors, keyword, city)
+    print(f"[Agent] 周边搜索模式：围绕 {len(anchors)} 个地点搜索「{keyword}」(半径{radius}米)...")
+    logger.info("周边搜索模式: anchors=%s, keyword=%s, city=%s, radius=%d", anchors, keyword, city, radius)
 
     all_pois: List[Dict[str, Any]] = []
     for anchor in anchors:
@@ -330,12 +383,12 @@ def _fetch_around_pois(
             print(f"[警告] 地点「{anchor}」无法解析为坐标，已跳过")
             logger.warning("地理编码失败，跳过锚点: %s", anchor)
             continue
-        print(f"[Agent] 正在搜索「{anchor}」周边 {config.AROUND_RADIUS} 米内的「{keyword}」...")
+        print(f"[Agent] 正在搜索「{anchor}」周边 {radius} 米内的「{keyword}」...")
         pois = fetch_pois_around(
             api_key=config.AMAP_API_KEY,
             location=location,
             keyword=keyword,
-            radius=config.AROUND_RADIUS,
+            radius=radius,
         )
         all_pois.extend(pois)
 
@@ -374,14 +427,18 @@ class FetchTask:
 
 def build_fetch_plan(intent: Dict[str, Any]) -> List[FetchTask]:
     """
-    意图 → 分片计划（统一区县拆分 B / 自动网格 D / 多锚点三种覆盖策略）。
+    意图 → 分片计划（统一区县拆分 B / 自动网格 D / 多锚点覆盖策略）。
 
-    计划按执行顺序排列：基础通道（text）在前，周边通道（around/grid）在后；
+    周边模式为**单通道**：只执行严格半径搜索（around 锚点 / grid 网格），
+    不再叠加行政区基础 text 搜索，避免混入远离中心点的行政区全域数据
+    （半径圈外店铺不会进入结果）。
+
+    计划按执行顺序排列：text 单元（非周边）在前，around/grid 单元（周边）在后；
     估算器（estimate_plan_requests）与执行器（execute_plan）共用同一份计划，
     保证“预估多少就执行多少”。
 
     参数：
-        intent: 意图字典（region/city/keyword/around/anchor）
+        intent: 意图字典（region/city/keyword/around/anchor/radius）
 
     返回：
         抓取单元列表（FetchTask）
@@ -391,35 +448,31 @@ def build_fetch_plan(intent: Dict[str, Any]) -> List[FetchTask]:
     city = intent.get("city", "") or ""
     around = bool(intent.get("around"))
     anchor = intent.get("anchor", "") or ""
+    radius = _normalize_radius(intent.get("radius"))
     districts = CITY_DISTRICTS.get(city) or []
     plan: List[FetchTask] = []
 
     if around:
-        # 通道一：基础搜索（text）
-        base_region = region or city
-        if base_region:
-            if not region and districts:
-                # B 方案：城市级输入拆分逐区县（各区县独立 200 条）
-                plan += [FetchTask("text", keyword=keyword, region=d, label=d) for d in districts]
-            else:
-                plan.append(FetchTask("text", keyword=keyword, region=base_region, label=base_region))
-        # 通道二：周边搜索
+        # 单通道（仅半径搜索）：锚点优先，无锚点但有城市时自动网格
         if anchor:
-            # 多锚点：每个锚点一个 around 单元
+            # 多锚点：每个锚点一个 around 单元（严格 radius 米圈内）
             plan += [
                 FetchTask("around", keyword=keyword, location=a,
-                          radius=config.AROUND_RADIUS, label=a)
+                          radius=radius, label=a)
                 for a in split_anchors(anchor)
             ]
         elif city:
-            # D 方案：自动网格
-            plan.append(FetchTask("grid", keyword=keyword, city=city, label=city))
+            # D 方案：自动网格（各网格圆心 radius 米圈内，突破单请求 200 条上限）
+            plan.append(FetchTask("grid", keyword=keyword, city=city, radius=radius, label=city))
     else:
         if region:
             plan.append(FetchTask("text", keyword=keyword, region=region, label=region))
         elif city and districts:
             # B 方案：城市级输入拆分逐区县
             plan += [FetchTask("text", keyword=keyword, region=d, label=d) for d in districts]
+        elif city:
+            # 表外城市（不在 CITY_DISTRICTS）：回退城市级整搜，避免全国检索混入其他城市数据
+            plan.append(FetchTask("text", keyword=keyword, region=city, label=city))
         else:
             plan.append(FetchTask("text", keyword=keyword, region="", label=""))
     return plan
@@ -450,7 +503,10 @@ def format_plan_summary(plan: List[FetchTask]) -> str:
     n_text = sum(1 for t in plan if t.mode == "text")
     n_around = sum(1 for t in plan if t.mode == "around")
     n_grid = sum(1 for t in plan if t.mode == "grid")
+    radius = next((t.radius for t in plan if t.radius), 0)
     parts = []
+    if radius:
+        parts.append(f"半径{radius}米")
     if n_text:
         parts.append(f"{n_text} 个行政区/区县")
     if n_around:
@@ -489,20 +545,20 @@ def execute_plan(keyword: str, plan: List[FetchTask], city: str = "") -> Tuple[L
             if not label:
                 label = t.label  # text 单元只记录首个标签(区县拆分时末尾统一为 city)
         elif t.mode == "around":
-            pois, lab = _fetch_around_pois(t.keyword, t.location, t.city)
+            pois, lab = _fetch_around_pois(t.keyword, t.location, t.city, t.radius)
             around_pois.extend(pois)
             if lab:
                 label = lab  # 周边锚点标签优先
         elif t.mode == "grid":
-            pois, lab = _fetch_grid_around_pois(t.keyword, t.city)
+            pois, lab = _fetch_grid_around_pois(t.keyword, t.city, t.radius)
             around_pois.extend(pois)
             if lab:
                 label = lab  # 网格标签(城市名)优先
 
-    # 去重（text 与 around 分别收集后统一合并）
+    # 去重（text 与 around 分别收集后统一合并；周边模式为单通道，text_pois 为空）
     raw_pois = _merge_pois(text_pois, around_pois)
     if text_pois and around_pois and len(raw_pois) < len(text_pois) + len(around_pois):
-        print(f"[进度] 双通道合并: 基础 {len(text_pois)} + 周边 {len(around_pois)} -> 去重 {len(raw_pois)} 条")
+        print(f"[进度] 多通道合并: 基础 {len(text_pois)} + 周边 {len(around_pois)} -> 去重 {len(raw_pois)} 条")
     elif text_pois and len(raw_pois) < len(text_pois):
         print(f"[进度] 跨区县去重: {len(text_pois)} -> {len(raw_pois)} 条")
     elif around_pois and len(raw_pois) < len(around_pois):
@@ -520,6 +576,7 @@ def execute_plan(keyword: str, plan: List[FetchTask], city: str = "") -> Tuple[L
 def _fetch_grid_around_pois(
     keyword: str,
     city: str,
+    radius: int = config.AROUND_RADIUS,
 ) -> Tuple[List[Dict[str, Any]], str]:
     """
     自动网格周边搜索（D 方案）：以城市中心铺 (2N+1)x(2N+1) 网格圆心逐点搜索。
@@ -530,6 +587,7 @@ def _fetch_grid_around_pois(
     参数：
         keyword: 搜索品类关键词
         city: 城市名（用于地理编码取中心坐标）
+        radius: 搜索半径（米），严格半径圈内数据
 
     返回：
         (去重后的 POI 列表, 展示用标签)
@@ -538,16 +596,19 @@ def _fetch_grid_around_pois(
     if not center:
         print(f"[警告] 城市「{city}」无法解析为坐标，自动网格跳过")
         return [], ""
-    grid_anchors = generate_grid_anchors(center, config.GRID_RADIUS, config.GRID_N)
+    # 网格间距与搜索半径联动（间距=radius/2，保证相邻搜索圆相互重叠不留空洞；
+    # 默认 radius=5000 时间距 2500，与历史 GRID_RADIUS 一致）
+    grid_spacing = max(radius // 2, 100)
+    grid_anchors = generate_grid_anchors(center, grid_spacing, config.GRID_N)
     print(f"[Agent] 自动网格：以「{city}」为中心生成 {len(grid_anchors)} 个网格圆心"
-          f"（半径{config.AROUND_RADIUS}米，突破单请求 200 条上限）...")
+          f"（半径{radius}米，圆心间距{grid_spacing}米，突破单请求 200 条上限）...")
     all_pois: List[Dict[str, Any]] = []
     for loc in grid_anchors:
         pois = fetch_pois_around(
             api_key=config.AMAP_API_KEY,
             location=loc,
             keyword=keyword,
-            radius=config.AROUND_RADIUS,
+            radius=radius,
         )
         if pois:
             print(f"[进度] 网格点 {loc} 获取 {len(pois)} 条")
@@ -583,8 +644,12 @@ def run_with_intent(intent: Dict[str, Any], user_input: str = "") -> Dict[str, A
     keyword = intent.get("keyword", "")
     modifier = intent.get("modifier")
 
-    logger.info("意图解析结果: region=%s, keyword=%s, modifier=%s, anchor=%s, around=%s",
-                region, keyword, modifier, intent.get("anchor", ""), intent.get("around", False))
+    # 半径归一化（未指定/非法回退默认 5km，clamp 500~50000），写回 intent 供后续使用
+    radius = _normalize_radius(intent.get("radius"))
+    intent["radius"] = radius
+
+    logger.info("意图解析结果: region=%s, keyword=%s, modifier=%s, anchor=%s, around=%s, radius=%d",
+                region, keyword, modifier, intent.get("anchor", ""), intent.get("around", False), radius)
 
     # 第二步：参数检查
     missing = _check_missing_params(intent)
@@ -620,7 +685,8 @@ def run_with_intent(intent: Dict[str, Any], user_input: str = "") -> Dict[str, A
             estimate = estimate_plan_requests(plan)
             remaining = quota_remaining()
             if estimate:
-                print(f"[Agent] ⚖️ 配额预估: {format_quota_summary(estimate)}")
+                # 注意:控制台打印避免 emoji 等非 GBK 字符(Windows GBK 控制台 print 会抛 UnicodeEncodeError)
+                print(f"[Agent] 配额预估: {format_quota_summary(estimate)}")
                 print(f"[Agent] 覆盖策略: {format_plan_summary(plan)}")
             if remaining <= 0:
                 print("[错误] 高德API配额已用尽（本月剩余 0 次），已中止搜索。"
@@ -687,7 +753,7 @@ def run_with_intent(intent: Dict[str, Any], user_input: str = "") -> Dict[str, A
                      statistics["total"], statistics["rating_count"])
 
         search_mode_desc = (
-            f"   - 搜索方式: 双通道（行政区基础搜索 + 周边搜索 半径{config.AROUND_RADIUS}米，已合并去重）\n"
+            f"   - 搜索方式: 严格半径搜索（半径 {radius} 米内，单通道，不含行政区全域数据）\n"
             if around and anchor_label else ""
         )
         result_msg = (
@@ -709,6 +775,7 @@ def run_with_intent(intent: Dict[str, Any], user_input: str = "") -> Dict[str, A
             "modifier": modifier,
             "anchor": anchor_text,
             "around": around,
+            "radius": radius,
         }
 
         # 保存搜索记录
@@ -789,11 +856,12 @@ def run(user_input: str) -> Dict[str, Any]:
         return {"success": False, "error": str(e)}
 
     # 兜底修正：输入含周边意图词（周边/附近/周围/一带）但 DeepSeek 漏判 around 时，
-    # 用 region（行政区）作为周边中心锚点，确保双通道搜索生效
+    # 用 region（行政区）或 city（城市）作为周边中心锚点，确保严格半径搜索生效
     if (not intent.get("around")) and re.search(r"周边|附近|周围|一带", user_input):
-        if not intent.get("anchor") and intent.get("region"):
-            logger.warning("意图解析漏判周边模式，兜底修正: anchor=%s, around=True", intent["region"])
-            intent["anchor"] = intent["region"]
+        if not intent.get("anchor") and (intent.get("region") or intent.get("city")):
+            anchor = intent.get("region") or intent.get("city")
+            logger.warning("意图解析漏判周边模式，兜底修正: anchor=%s, around=True", anchor)
+            intent["anchor"] = anchor
             intent["around"] = True
 
     return run_with_intent(intent, user_input=user_input)

@@ -84,11 +84,11 @@ MAX_RETRIES: int = 3           # 网络超时重试次数
 PAGE_SIZE: int = 20            # 高德API每页返回条数
 
 # --- 周边搜索 ---
-AROUND_RADIUS: int = 3000      # 周边搜索默认半径（米），高德上限 50000
+AROUND_RADIUS: int = 5000      # 周边搜索默认半径（米），默认 5km；可被意图/中心点动态覆盖，高德上限 50000
 AROUND_PAGE_SIZE: int = 25     # 周边搜索每页条数（高德上限 25）
 
 # --- 自动网格铺点（突破单请求 200 条限制，配合 generate_grid_anchors 使用）---
-GRID_RADIUS: int = 2500        # 相邻网格圆心间距（米），小于 AROUND_RADIUS 保证覆盖重叠
+GRID_RADIUS: int = 2500        # 网格圆心间距默认值（米）；实际执行时由搜索半径推导（radius//2，默认 5000→2500）
 GRID_N: int = 1                # 网格半边长：0=仅中心点(1x1)，1=3x3(9点)，2=5x5(25点)
 
 # --- 配额预算（本地账本记账；高德不提供剩余配额查询）---
