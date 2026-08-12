@@ -15,6 +15,7 @@ POI数据抓取模块 - 调用高德地图API获取商家信息
 4. 配额超限时立即终止
 """
 
+import re
 import time
 import logging
 from typing import Any, Dict, List, Optional
@@ -25,6 +26,7 @@ from amap_agent.config import (
     PLACE_TEXT_URL,
     PLACE_AROUND_URL,
     GEOCODE_URL,
+    REVERSE_GEOCODE_URL,
     REQUEST_INTERVAL,
     MAX_RETRIES,
     PAGE_SIZE,
@@ -220,10 +222,15 @@ def geocode_address(
     """
     地理编码：将文本地址转换为经纬度字符串（"经度,纬度"）。
 
+    增强逻辑（防止跨省错配，如"江阴市人民西路"被解析到河北衡水）：
+    1. 构造城市候选：显式 city → 地址中的市名 → 县级市映射的地级市 → 不限定
+    2. 对每个候选 geocode，结果用逆地理编码校验省份/城市是否与地址匹配
+    3. 通过校验即返回；全部候选错配则降级返回首个结果（并告警）
+
     参数：
         api_key: 高德地图API Key
         address: 结构化地址描述（如"南京市鼓楼区政府大楼"）
-        city: 可选，指定城市以收窄歧义（如"南京"）
+        city: 可选，指定地级市名以收窄歧义（如"无锡市"）
 
     返回：
         经纬度字符串（如 "118.777636,32.061586"）；解析失败返回 None
@@ -235,41 +242,154 @@ def geocode_address(
         logger.warning("geocode 收到空地址")
         return None
 
-    params: Dict[str, Any] = {
-        "key": api_key,
-        "address": address,
-    }
-    if city:
-        params["city"] = city
+    expected = _expected_region(address)
+    last_loc: Optional[str] = None
 
-    logger.info("地理编码: address='%s', city='%s'", address, city or "未指定")
-    data = _request_with_retry(GEOCODE_URL, params)
+    for cand in _city_candidates(address, city):
+        params: Dict[str, Any] = {"key": api_key, "address": address}
+        if cand:
+            params["city"] = cand
+        logger.info("地理编码: address='%s', city=%r", address, cand or "不限定")
 
-    geocodes = data.get("geocodes") or []
-    if not geocodes:
-        logger.warning("地理编码无结果: address='%s'", address)
-        return None
+        data = _request_with_retry(GEOCODE_URL, params)
+        geocodes = data.get("geocodes") or []
+        if not geocodes:
+            continue
 
-    # 歧义消解：多个候选结果时优先精确级别（兴趣点/门牌号 > 道路 > 乡镇/街道 > 区县 > 城市）
-    best = geocodes[0]
-    best_prio = _GEOCODE_LEVEL_PRIORITY.get(best.get("level", ""), 99)
-    for g in geocodes[1:]:
-        prio = _GEOCODE_LEVEL_PRIORITY.get(g.get("level", ""), 99)
-        if prio < best_prio:
-            best, best_prio = g, prio
+        # 歧义消解：多个候选结果时优先精确级别（兴趣点/门牌号 > 道路 > 乡镇/街道 > 区县 > 城市）
+        best = geocodes[0]
+        best_prio = _GEOCODE_LEVEL_PRIORITY.get(best.get("level", ""), 99)
+        for g in geocodes[1:]:
+            prio = _GEOCODE_LEVEL_PRIORITY.get(g.get("level", ""), 99)
+            if prio < best_prio:
+                best, best_prio = g, prio
 
-    if best is not geocodes[0]:
-        logger.info("地理编码歧义消解: %d 个候选中优先 level='%s' 的 '%s'",
-                    len(geocodes), best.get("level", ""), best.get("formatted_address", ""))
+        location = best.get("location", "")
+        if not location:
+            continue
+        last_loc = location
 
-    location = best.get("location", "")
-    if not location:
-        logger.warning("地理编码结果缺少 location: address='%s'", address)
-        return None
+        # 逆地理编码校验：坐标是否落在地址声明的省份/城市内
+        if _verify_location(api_key, location, expected):
+            logger.info("地理编码成功: '%s' -> %s (level=%s, city=%s)",
+                        address, location, best.get("level", ""), cand or "不限定")
+            return location
 
-    logger.info("地理编码成功: '%s' -> %s (level=%s)",
-                address, location, best.get("level", ""))
-    return location
+        # 校验未通过：可能是跨省错配，尝试下一个城市候选
+        time.sleep(0.3)
+
+    if last_loc:
+        logger.warning("地理编码全部候选均未通过省市校验，降级返回首个结果: %s -> %s", address, last_loc)
+        return last_loc
+    logger.warning("地理编码无结果: address='%s'", address)
+    return None
+
+
+# 县级市 → 地级市映射（高德 geocode 的 city 参数仅识别地级市；传县级市会被忽略导致跨省错配）
+# 常用县级市列出，可按需扩展
+_COUNTY_TO_PREFECTURE = {
+    # 江苏
+    "江阴市": "无锡市", "宜兴市": "无锡市",
+    "昆山市": "苏州市", "太仓市": "苏州市", "常熟市": "苏州市", "张家港市": "苏州市",
+    "溧阳市": "常州市",
+    "启东市": "南通市", "如皋市": "南通市", "海门市": "南通市", "海安市": "南通市",
+    "丹阳市": "镇江市", "扬中市": "镇江市", "句容市": "镇江市",
+    "高邮市": "扬州市", "仪征市": "扬州市",
+    "兴化市": "泰州市", "靖江市": "泰州市", "泰兴市": "泰州市",
+    "新沂市": "徐州市", "邳州市": "徐州市",
+    "东台市": "盐城市",
+    # 浙江
+    "义乌市": "金华市", "东阳市": "金华市", "永康市": "金华市", "兰溪市": "金华市",
+    "慈溪市": "宁波市", "余姚市": "宁波市",
+    "瑞安市": "温州市", "乐清市": "温州市",
+    "平湖市": "嘉兴市", "海宁市": "嘉兴市", "桐乡市": "嘉兴市",
+    "诸暨市": "绍兴市",
+    "温岭市": "台州市", "临海市": "台州市", "玉环市": "台州市",
+    "江山市": "衢州市", "龙泉市": "丽水市",
+    # 福建
+    "福清市": "福州市", "石狮市": "泉州市", "晋江市": "泉州市", "南安市": "泉州市",
+    "龙海市": "漳州市", "永安": "三明市", "武夷山市": "南平市",
+    # 广东
+    "开平市": "江门市", "台山市": "江门市", "鹤山市": "江门市", "恩平市": "江门市",
+    "普宁市": "揭阳市", "陆丰市": "汕尾市", "兴宁市": "梅州市",
+    "英德市": "清远市", "连州市": "清远市",
+    "廉江市": "湛江市", "雷州市": "湛江市", "吴川市": "湛江市",
+    "高州市": "茂名市", "化州市": "茂名市", "信宜市": "茂名市",
+    "四会市": "肇庆市",
+    # 湖南
+    "浏阳市": "长沙市", "宁乡市": "长沙市", "醴陵市": "株洲市",
+    "常宁市": "衡阳市", "耒阳市": "衡阳市", "沅江市": "益阳市", "津市市": "常德市",
+    # 其他
+    "岑溪市": "梧州市", "桂平市": "贵港市",
+}
+
+_CITY_RE = re.compile(r"([\u4e00-\u9fa5]{2,8}(?:市|自治州|地区))")
+
+
+def _extract_city_names(address: str) -> List[str]:
+    """提取地址中出现的市/自治州/地区名（去重保序）。"""
+    names = []
+    for m in _CITY_RE.findall(address or ""):
+        if m not in names:
+            names.append(m)
+    return names
+
+
+def _city_candidates(address: str, explicit_city: str = "") -> List[str]:
+    """
+    构造 geocode city 候选列表（去重保序）：
+    显式 city → 地址提取的市名 → 县级市映射的地级市 → 空（不限定）。
+    """
+    cands: List[str] = []
+    for c in (explicit_city,):
+        if c and c not in cands:
+            cands.append(c)
+    for name in _extract_city_names(address):
+        if name not in cands:
+            cands.append(name)
+        mapped = _COUNTY_TO_PREFECTURE.get(name)
+        if mapped and mapped not in cands:
+            cands.append(mapped)
+    cands.append("")  # 最后不限定城市兜底
+    return cands
+
+
+def _expected_region(address: str):
+    """
+    从地址提取期望省份与城市（供 geocode 结果校验）：
+    返回 (province_set, city_set, mapped_prefecture_set)
+    """
+    provinces = set(re.findall(r"([\u4e00-\u9fa5]{2,4}省)", address or ""))
+    cities = set(_extract_city_names(address))
+    prefectures = {_COUNTY_TO_PREFECTURE[c] for c in cities if c in _COUNTY_TO_PREFECTURE}
+    return provinces, cities, prefectures
+
+
+def _verify_location(api_key: str, location: str, expected) -> bool:
+    """
+    逆地理编码校验坐标是否落在期望省份/城市内。
+
+    expected: _expected_region 返回的 (provinces, cities, prefectures)
+    地址中无省份/城市信息时返回 True（无从校验）。
+    """
+    provinces, cities, prefectures = expected
+    if not provinces and not cities:
+        return True
+    try:
+        data = _request_with_retry(REVERSE_GEOCODE_URL, {"key": api_key, "location": location})
+        ac = (data.get("regeocode") or {}).get("addressComponent") or {}
+        province = ac.get("province", "")
+        city = ac.get("city", "") or ac.get("district", "")
+        matched = province in provinces or city in cities or city in prefectures
+        if not matched:
+            logger.warning(
+                "地理编码结果校验未通过: 期望省%s/市%s，实际 %s/%s (location=%s)",
+                provinces, cities, province, city, location,
+            )
+        return matched
+    except Exception as e:
+        logger.warning("逆地理编码校验失败（不阻断）: %s", e)
+        return True
 
 
 def split_anchors(anchor_text: str) -> List[str]:
